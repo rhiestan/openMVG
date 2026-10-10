@@ -75,6 +75,23 @@ if (DEFINED OpenMVG_USE_INTERNAL_FLANN)
   add_subdirectory(flann)
 endif()
 
+# Fast SIFT keypoints and descriptors (LeanSift), used by the SIFT image describer
+set(LSIFT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(LSIFT_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(LSIFT_INSTALL OFF CACHE BOOL "" FORCE)
+add_subdirectory(LeanSIFT)
+set_property(TARGET lsift PROPERTY FOLDER OpenMVG/3rdParty/LeanSIFT)
+install(TARGETS lsift hwy EXPORT openMVG-targets
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(DIRECTORY LeanSIFT/include/lsift
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+  COMPONENT headers)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/LeanSIFT/include/lsift/export.hpp
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/lsift
+  COMPONENT headers)
+
 # Exif data parsing
 add_subdirectory(easyexif)
 

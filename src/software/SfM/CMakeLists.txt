@@ -44,7 +44,7 @@ target_link_libraries(openMVG_main_ComputeFeatures
     openMVG_multiview
     openMVG_sfm
     ${STLPLUS_LIBRARY}
-    vlsift
+    openMVG_sift
 )
 if (MSVC)
   set_target_properties(openMVG_main_ComputeFeatures PROPERTIES COMPILE_FLAGS "/bigobj")
@@ -278,7 +278,7 @@ if(OpenMVG_USE_OPENCV)
     openMVG_multiview
     openMVG_sfm
     ${STLPLUS_LIBRARY}
-    vlsift
+    openMVG_sift
     ${OpenCV_LIBS})
   target_include_directories(openMVG_main_ComputeFeatures_OpenCV PRIVATE ${OpenCV_INCLUDE_DIRS})
 

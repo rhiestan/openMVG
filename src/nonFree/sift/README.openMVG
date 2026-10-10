@@ -1,2 +1,6 @@
-http://www.vlfeat.org/
-Vedaldi SIFT extractor.
+SIFT image describer ("SIFT", SIFT_Image_describer).
+
+Keypoints and descriptors are computed by LeanSift
+(https://github.com/rhiestan/LeanSIFT, vendored in third_party/LeanSIFT), a fast
+SIMD and multi-threaded SIFT that reproduces VLFeat's vl_sift. It replaces the
+VLFeat SIFT code (http://www.vlfeat.org/) that used to live in vl/.

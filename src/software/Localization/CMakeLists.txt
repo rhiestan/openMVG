@@ -11,7 +11,7 @@ target_link_libraries(openMVG_main_SfM_Localization
   openMVG_sfm
   openMVG_exif
   ${STLPLUS_LIBRARY}
-  vlsift
+  openMVG_sift
   )
 
 # Installation rules

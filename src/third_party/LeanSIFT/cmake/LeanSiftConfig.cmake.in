@@ -1,0 +1,8 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+find_dependency(hwy)
+
+include("${CMAKE_CURRENT_LIST_DIR}/LeanSiftTargets.cmake")
+check_required_components(LeanSift)

@@ -1,0 +1,12 @@
+Project: LeanSift
+URL: https://github.com/rhiestan/LeanSIFT
+License: BSD-2-Clause
+Upstream commit: 9c621f8f7075dbb3d164c620fa90cf02a26a449d
+
+Only the library is vendored (CMakeLists.txt, cmake/, include/, src/); the
+tests, tools and their support code are not. Google Highway, its only
+dependency, is fetched by CMake (FetchContent); set
+FETCHCONTENT_SOURCE_DIR_HWY to a local Highway 1.4.0 checkout to build offline.
+
+Used by nonFree/sift/SIFT_describer.hpp (the "SIFT" image describer) in place
+of VLFeat's SIFT.

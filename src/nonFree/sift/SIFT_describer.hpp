@@ -13,13 +13,12 @@
 #include "openMVG/features/regions_factory.hpp"
 #include "openMVG/image/image_container.hpp"
 
+#include "lsift/lsift.hpp"
+
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <numeric>
-
-extern "C" {
-#include "nonFree/sift/vl/sift.h"
-}
 
 namespace openMVG {
 namespace features {
@@ -28,8 +27,10 @@ namespace features {
 // [1] R. Arandjelović, A. Zisserman.
 // Three things everyone should know to improve object retrieval. CVPR2012.
 
+// Convert a L2-normalized float SIFT descriptor to bytes, as vl_sift does:
+// min(512 d, 255).
 inline void siftDescToUChar(
-  vl_sift_pix descr[128],
+  const float descr[128],
   Descriptor<unsigned char,128> & descriptor,
   bool brootSift = false)
 {
@@ -37,11 +38,12 @@ inline void siftDescToUChar(
     // rootsift = sqrt( sift / sum(sift) );
     const float sum = std::accumulate(descr, descr+128, 0.0f);
     for (int k=0;k<128;++k)
-      descriptor[k] = static_cast<unsigned char>(512.f*sqrt(descr[k]/sum));
+      descriptor[k] = static_cast<unsigned char>(
+        std::min(512.f*std::sqrt(descr[k]/sum), 255.f));
   }
   else
     for (int k=0;k<128;++k)
-    descriptor[k] = static_cast<unsigned char>(512.f*descr[k]);
+      descriptor[k] = static_cast<unsigned char>(std::min(512.f*descr[k], 255.f));
 }
 
 class SIFT_Image_describer : public Image_describer
@@ -88,12 +90,6 @@ public:
     bool bOrientation = true
   ):Image_describer(), _params(params), _bOrientation(bOrientation)
   {
-    vl_constructor();
-  }
-
-  ~SIFT_Image_describer()
-  {
-    vl_destructor();
   }
 
   bool Set_configuration_preset(EDESCRIBER_PRESET preset) override
@@ -143,79 +139,46 @@ public:
       const image::Image<unsigned char>* mask = nullptr
   )
   {
-    const int w = image.Width(), h = image.Height();
-    //Convert to float
-    const image::Image<float> If(image.GetMat().cast<float>());
-
-    VlSiftFilt *filt = vl_sift_new(w, h,
-      _params._num_octaves, _params._num_scales, _params._first_octave);
+    // LeanSift reproduces VLFeat's vl_sift. It maps 8-bit pixels to [0, 1],
+    // so the peak threshold is not scaled by 255 as it was for VLFeat.
+    lsift::Params params;
+    params.first_octave = _params._first_octave;
+    params.num_octaves = _params._num_octaves;
+    params.levels_per_octave = _params._num_scales;
+    params.peak_threshold = _params._peak_threshold >= 0
+      ? _params._peak_threshold / _params._num_scales : 0.0;
     if (_params._edge_threshold >= 0)
-      vl_sift_set_edge_thresh(filt, _params._edge_threshold);
-    if (_params._peak_threshold >= 0)
-      vl_sift_set_peak_thresh(filt, 255*_params._peak_threshold/_params._num_scales);
+      params.edge_threshold = _params._edge_threshold;
+    params.upright = !_bOrientation;
 
-    Descriptor<vl_sift_pix, 128> descr;
-    Descriptor<unsigned char, 128> descriptor;
+    // A Sift object must not be shared between threads, and Describe may be
+    // called concurrently (e.g. one image per thread), so use one per call.
+    // It runs on LeanSift's process-wide thread pool.
+    lsift::Sift sift(params);
+    const lsift::Features features = sift.extract(lsift::ImageView::gray8(
+      image.data(), image.Width(), image.Height()));
 
-    // Process SIFT computation
-    vl_sift_process_first_octave(filt, If.data());
-
-    // Build alias to cached data
     auto regions = std::unique_ptr<Regions_type>(new Regions_type);
+    regions->Features().reserve(features.size());
+    regions->Descriptors().reserve(features.size());
 
-    // reserve some memory for faster keypoint saving
-    regions->Features().reserve(2000);
-    regions->Descriptors().reserve(2000);
+    Descriptor<unsigned char, 128> descriptor;
+    for (std::size_t i = 0; i < features.size(); ++i)
+    {
+      const lsift::Keypoint & key = features.keypoints[i];
 
-    while (true) {
-      vl_sift_detect(filt);
-
-      VlSiftKeypoint const *keys  = vl_sift_get_keypoints(filt);
-      const int nkeys = vl_sift_get_nkeypoints(filt);
-
-      // Update gradient before launching parallel extraction
-      vl_sift_update_gradient(filt);
-
-      #ifdef OPENMVG_USE_OPENMP
-      #pragma omp parallel for private(descr, descriptor)
-      #endif
-      for (int i = 0; i < nkeys; ++i) {
-
-        // Feature masking
-        if (mask)
-        {
-          const image::Image<unsigned char> & maskIma = *mask;
-          if (maskIma(keys[i].y, keys[i].x) == 0)
-            continue;
-        }
-
-        double angles [4] = {0.0, 0.0, 0.0, 0.0};
-        int nangles = 1; // by default (1 upright feature)
-        if (_bOrientation)
-        { // compute from 1 to 4 orientations
-          nangles = vl_sift_calc_keypoint_orientations(filt, angles, keys+i);
-        }
-
-        for (int q=0 ; q < nangles ; ++q) {
-          vl_sift_calc_keypoint_descriptor(filt, &descr[0], keys+i, angles[q]);
-          const SIOPointFeature fp(keys[i].x, keys[i].y,
-            keys[i].sigma, static_cast<float>(angles[q]));
-
-          siftDescToUChar(&descr[0], descriptor, _params._root_sift);
-          #ifdef OPENMVG_USE_OPENMP
-          #pragma omp critical
-          #endif
-          {
-            regions->Descriptors().push_back(descriptor);
-            regions->Features().push_back(fp);
-          }
-        }
+      // Feature masking
+      if (mask)
+      {
+        const image::Image<unsigned char> & maskIma = *mask;
+        if (maskIma(static_cast<int>(key.y), static_cast<int>(key.x)) == 0)
+          continue;
       }
-      if (vl_sift_process_next_octave(filt))
-        break; // Last octave
-    }
-    vl_sift_delete(filt);
 
+      siftDescToUChar(features.descriptor(i), descriptor, _params._root_sift);
+      regions->Descriptors().push_back(descriptor);
+      regions->Features().emplace_back(key.x, key.y, key.sigma, key.angle);
+    }
     return regions;
   }
 
