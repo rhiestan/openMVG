@@ -22,33 +22,27 @@ namespace matching {
 //
 //   |a - b|^2 = |a|^2 + |b|^2 - 2 a.b
 //
-// The dot products between a tile of the descriptors of one image and a tile
-// of the other are one GEMM (Eigen). The two nearest neighbours of every row
-// AND of every column are updated from that tile, so both matching directions,
-// and therefore the mutual nearest neighbour check, come from a single pass.
+// The two nearest neighbours of every row AND of every column are updated from
+// the products, so both matching directions, and therefore the mutual nearest
+// neighbour check, come from a single pass.
 //
-// For 8-bit descriptors (SIFT) the result is exact, identical to
-// BRUTE_FORCE_L2: every partial sum of a dot product is an integer below 2^24
-// (128 * 255^2), which float arithmetic represents without rounding, in any
-// summation order. For float descriptors the distances carry the usual
-// rounding of the expansion above (clamped at zero).
+// 8-bit descriptors (SIFT) use an integer kernel written with Google Highway
+// (matcher_gemm_hwy.cpp), dispatched at run time to the best SIMD target of
+// the CPU. Its arithmetic is exact, so the result is identical to
+// BRUTE_FORCE_L2. Float descriptors use Eigen's float GEMM, tile by tile; for
+// them the distances carry the usual rounding of the expansion above
+// (clamped at zero).
 
-/// The descriptors of one image as rows of a float matrix, with their squared
-/// norms. Supports unsigned char and float scalar regions.
+/// The descriptors of one image (rows). Supports unsigned char and float
+/// scalar regions.
 class GemmDescriptors
 {
 public:
   using Matrix = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
   GemmDescriptors() = default;
-
-  template <typename Scalar>
-  GemmDescriptors(const Scalar * data, int count, int dimension)
-  {
-    using ScalarMatrix = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-    descriptors_ = Eigen::Map<const ScalarMatrix>(data, count, dimension).template cast<float>();
-    squared_norms_ = descriptors_.rowwise().squaredNorm();
-  }
+  GemmDescriptors(const unsigned char * data, int count, int dimension);
+  GemmDescriptors(const float * data, int count, int dimension);
 
   /// Empty (count() == 0) if the regions type is not supported.
   explicit GemmDescriptors(const features::Regions & regions);
@@ -56,14 +50,20 @@ public:
   /// True if GemmDescriptors can be built from regions of this type.
   static bool IsSupported(const features::Regions & regions);
 
-  int count() const { return static_cast<int>(descriptors_.rows()); }
-  int dimension() const { return static_cast<int>(descriptors_.cols()); }
-  const Matrix & descriptors() const { return descriptors_; }
-  const Eigen::VectorXf & squared_norms() const { return squared_norms_; }
+  int count() const { return count_; }
+  int dimension() const { return dimension_; }
+  /// True for 8-bit descriptors, stored in bytes().
+  bool is_8bit() const { return !bytes_.empty(); }
+  /// The 8-bit descriptors, row-major; empty for float descriptors.
+  const std::vector<unsigned char> & bytes() const { return bytes_; }
+  /// The descriptors as floats (converted on each call for 8-bit ones).
+  Matrix FloatDescriptors() const;
 
 private:
-  Matrix descriptors_;
-  Eigen::VectorXf squared_norms_;
+  int count_ = 0;
+  int dimension_ = 0;
+  std::vector<unsigned char> bytes_;
+  Matrix floats_;
 };
 
 /// The two nearest neighbours of each descriptor of a set.
@@ -80,6 +80,7 @@ struct NearestNeighbours2
  * @brief Two nearest neighbours of each row of `a` among the rows of `b`, and
  * of each row of `b` among the rows of `a`, in one pass. Either output may be
  * null to skip that direction. Ties are resolved towards the smaller index.
+ * Uses the Highway kernel when both sets are 8-bit, Eigen otherwise.
  * Runs on the calling thread; parallelize over image pairs.
  */
 void GemmNearestNeighbours
@@ -89,6 +90,19 @@ void GemmNearestNeighbours
   NearestNeighbours2 * a_to_b,
   NearestNeighbours2 * b_to_a
 );
+
+/// GemmNearestNeighbours with Eigen's float GEMM for any descriptor type
+/// (the reference implementation, and the path for float descriptors).
+void GemmNearestNeighboursEigen
+(
+  const GemmDescriptors & a,
+  const GemmDescriptors & b,
+  NearestNeighbours2 * a_to_b,
+  NearestNeighbours2 * b_to_a
+);
+
+/// Name of the SIMD target the 8-bit kernel runs on, e.g. "AVX2".
+const char * GemmTargetName();
 
 /**
  * @brief Matches (index in a, index in b) whose nearest neighbour passes the

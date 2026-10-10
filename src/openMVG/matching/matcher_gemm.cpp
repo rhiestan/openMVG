@@ -5,11 +5,13 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 #include "openMVG/matching/matcher_gemm.hpp"
+#include "openMVG/matching/matcher_gemm_hwy.hpp"
 
 #include "openMVG/system/logger.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <typeinfo>
 
@@ -27,6 +29,26 @@ constexpr int kTileRows = 256;
 constexpr int kTileCols = 1024;
 
 } // namespace
+
+GemmDescriptors::GemmDescriptors(const unsigned char * data, int count, int dimension)
+  : count_(count), dimension_(dimension),
+    bytes_(data, data + static_cast<size_t>(count) * dimension)
+{
+}
+
+GemmDescriptors::GemmDescriptors(const float * data, int count, int dimension)
+  : count_(count), dimension_(dimension),
+    floats_(Eigen::Map<const Matrix>(data, count, dimension))
+{
+}
+
+GemmDescriptors::Matrix GemmDescriptors::FloatDescriptors() const
+{
+  if (!is_8bit())
+    return floats_;
+  using ByteMatrix = Eigen::Matrix<unsigned char, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+  return Eigen::Map<const ByteMatrix>(bytes_.data(), count_, dimension_).cast<float>();
+}
 
 GemmDescriptors::GemmDescriptors(const features::Regions & regions)
 {
@@ -73,6 +95,12 @@ void GemmNearestNeighbours
   NearestNeighbours2 * b_to_a
 )
 {
+  if (!a.is_8bit() || !b.is_8bit())
+  {
+    GemmNearestNeighboursEigen(a, b, a_to_b, b_to_a);
+    return;
+  }
+
   const int count_a = a.count();
   const int count_b = b.count();
   if (a_to_b)
@@ -88,6 +116,79 @@ void GemmNearestNeighbours
     return;
   }
 
+  std::vector<int32_t> a_index, a_distance1, a_distance2;
+  std::vector<int32_t> b_index, b_distance1, b_distance2;
+  if (a_to_b)
+  {
+    a_index.resize(count_a);
+    a_distance1.resize(count_a);
+    a_distance2.resize(count_a);
+  }
+  if (b_to_a)
+  {
+    b_index.resize(count_b);
+    b_distance1.resize(count_b);
+    b_distance2.resize(count_b);
+  }
+  internal::GemmNearestNeighboursU8(
+    a.bytes().data(), count_a, b.bytes().data(), count_b, a.dimension(),
+    a_to_b ? a_index.data() : nullptr, a_distance1.data(), a_distance2.data(),
+    b_to_a ? b_index.data() : nullptr, b_distance1.data(), b_distance2.data());
+
+  // The integer distances are exact, and so are their float conversions.
+  const auto convert = [](const std::vector<int32_t> & index,
+                          const std::vector<int32_t> & distance1,
+                          const std::vector<int32_t> & distance2,
+                          NearestNeighbours2 * nn)
+  {
+    for (size_t i = 0; i < index.size(); ++i)
+    {
+      nn->index[i] = index[i];
+      if (distance1[i] < internal::kGemmNoNeighbour)
+        nn->distance1[i] = static_cast<float>(distance1[i]);
+      if (distance2[i] < internal::kGemmNoNeighbour)
+        nn->distance2[i] = static_cast<float>(distance2[i]);
+    }
+  };
+  if (a_to_b)
+    convert(a_index, a_distance1, a_distance2, a_to_b);
+  if (b_to_a)
+    convert(b_index, b_distance1, b_distance2, b_to_a);
+}
+
+const char * GemmTargetName()
+{
+  return internal::GemmU8TargetName();
+}
+
+void GemmNearestNeighboursEigen
+(
+  const GemmDescriptors & a,
+  const GemmDescriptors & b,
+  NearestNeighbours2 * a_to_b,
+  NearestNeighbours2 * b_to_a
+)
+{
+  const int count_a = a.count();
+  const int count_b = b.count();
+  if (a_to_b)
+    a_to_b->Reset(count_a);
+  if (b_to_a)
+    b_to_a->Reset(count_b);
+  if (count_a == 0 || count_b == 0 || (!a_to_b && !b_to_a))
+    return;
+  if (a.dimension() != b.dimension())
+  {
+    OPENMVG_LOG_ERROR << "GemmNearestNeighbours: descriptor dimensions differ ("
+      << a.dimension() << " vs " << b.dimension() << ")";
+    return;
+  }
+
+  const GemmDescriptors::Matrix descriptors_a = a.FloatDescriptors();
+  const GemmDescriptors::Matrix descriptors_b = b.FloatDescriptors();
+  const Eigen::VectorXf squared_norms_a = descriptors_a.rowwise().squaredNorm();
+  const Eigen::VectorXf squared_norms_b = descriptors_b.rowwise().squaredNorm();
+
   // Column-major, so that one column of a tile (one descriptor of b against
   // kTileRows descriptors of a) is contiguous.
   Eigen::MatrixXf dots(kTileRows, kTileCols);
@@ -100,14 +201,14 @@ void GemmNearestNeighbours
     {
       const int rows = std::min(kTileRows, count_a - row0);
       dots.topLeftCorner(rows, cols).noalias() =
-        a.descriptors().middleRows(row0, rows) *
-        b.descriptors().middleRows(col0, cols).transpose();
+        descriptors_a.middleRows(row0, rows) *
+        descriptors_b.middleRows(col0, cols).transpose();
 
-      const float * norms_a = a.squared_norms().data() + row0;
+      const float * norms_a = squared_norms_a.data() + row0;
       for (int c = 0; c < cols; ++c)
       {
         const int j = col0 + c;
-        const float norm_b = b.squared_norms()[j];
+        const float norm_b = squared_norms_b[j];
         const float * dot = dots.data() + static_cast<Eigen::Index>(c) * kTileRows;
         float * dist = distances.data();
         for (int r = 0; r < rows; ++r)

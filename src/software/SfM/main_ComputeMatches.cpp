@@ -13,6 +13,7 @@
 #include "openMVG/matching/pairwiseAdjacencyDisplay.hpp"
 #include "openMVG/matching_image_collection/Cascade_Hashing_Matcher_Regions.hpp"
 #include "openMVG/matching_image_collection/Matcher_Regions.hpp"
+#include "openMVG/matching/matcher_gemm.hpp"
 #include "openMVG/matching_image_collection/Pair_Builder.hpp"
 #include "openMVG/sfm/pipelines/sfm_features_provider.hpp"
 #include "openMVG/sfm/pipelines/sfm_preemptive_regions_provider.hpp"
@@ -291,7 +292,7 @@ int main( int argc, char** argv )
     else
     if (sNearestMatchingMethod == "GEMML2")
     {
-      OPENMVG_LOG_INFO << "Using GEMM_L2 matcher";
+      OPENMVG_LOG_INFO << "Using GEMM_L2 matcher (" << GemmTargetName() << ")";
       collectionMatcher.reset(new Matcher_Regions(fDistRatio, GEMM_L2, bMutual));
     }
     else

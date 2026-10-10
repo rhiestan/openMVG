@@ -21,6 +21,8 @@
 
 #include "testing/testing.h"
 
+#include "hwy/targets.h"
+
 #include <iostream>
 #include <random>
 
@@ -322,6 +324,49 @@ TEST(Matching, RegionsMatcherGemmL2_SameAsBruteForce)
   EXPECT_TRUE(!gemm_mutual.empty());
   EXPECT_TRUE(gemm_mutual.size() <= gemm.size());
   EXPECT_TRUE(gemm_mutual == brute_force_mutual);
+}
+
+TEST(Matching, GemmNearestNeighbours_HighwaySameAsEigen)
+{
+  // Odd dimension and counts that are not multiples of the kernel's blocks.
+  const int count_a = 37, count_b = 203, dimension = 61;
+  std::vector<unsigned char> a, b;
+  MakeDescriptorSets(count_a, count_b, dimension, a, b);
+  const GemmDescriptors da(a.data(), count_a, dimension), db(b.data(), count_b, dimension);
+
+  NearestNeighbours2 hwy_a_to_b, hwy_b_to_a, eigen_a_to_b, eigen_b_to_a;
+  GemmNearestNeighbours(da, db, &hwy_a_to_b, &hwy_b_to_a);
+  GemmNearestNeighboursEigen(da, db, &eigen_a_to_b, &eigen_b_to_a);
+  EXPECT_TRUE(hwy_a_to_b.distance1 == eigen_a_to_b.distance1);
+  EXPECT_TRUE(hwy_a_to_b.distance2 == eigen_a_to_b.distance2);
+  EXPECT_TRUE(hwy_a_to_b.index == eigen_a_to_b.index);
+  EXPECT_TRUE(hwy_b_to_a.distance1 == eigen_b_to_a.distance1);
+  EXPECT_TRUE(hwy_b_to_a.distance2 == eigen_b_to_a.distance2);
+  EXPECT_TRUE(hwy_b_to_a.index == eigen_b_to_a.index);
+
+  // Only one direction asked for.
+  NearestNeighbours2 only_b_to_a;
+  GemmNearestNeighbours(da, db, nullptr, &only_b_to_a);
+  EXPECT_TRUE(only_b_to_a.index == eigen_b_to_a.index);
+
+  // Every SIMD target compiled in that this CPU supports.
+  for (const int64_t target : hwy::SupportedAndGeneratedTargets())
+  {
+    hwy::SetSupportedTargetsForTest(target);
+    NearestNeighbours2 a_to_b, b_to_a;
+    GemmNearestNeighbours(da, db, &a_to_b, &b_to_a);
+    std::cout << "GEMM target " << GemmTargetName() << ": "
+      << (a_to_b.distance1 == eigen_a_to_b.distance1 && a_to_b.index == eigen_a_to_b.index &&
+          b_to_a.distance2 == eigen_b_to_a.distance2 && b_to_a.index == eigen_b_to_a.index
+          ? "same as Eigen" : "DIFFERENT") << std::endl;
+    EXPECT_TRUE(a_to_b.distance1 == eigen_a_to_b.distance1);
+    EXPECT_TRUE(a_to_b.distance2 == eigen_a_to_b.distance2);
+    EXPECT_TRUE(a_to_b.index == eigen_a_to_b.index);
+    EXPECT_TRUE(b_to_a.distance1 == eigen_b_to_a.distance1);
+    EXPECT_TRUE(b_to_a.distance2 == eigen_b_to_a.distance2);
+    EXPECT_TRUE(b_to_a.index == eigen_b_to_a.index);
+  }
+  hwy::SetSupportedTargetsForTest(0);  // back to the best target
 }
 
 TEST(Matching, GemmNearestNeighbours_Empty)

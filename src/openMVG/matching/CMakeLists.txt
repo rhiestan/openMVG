@@ -32,6 +32,7 @@ target_link_libraries(openMVG_matching
   PRIVATE
     ${STLPLUS_LIBRARY}
     ${OPENMVG_LIBRARY_DEPENDENCIES}
+    hwy
   PUBLIC
     openMVG_features
     Threads::Threads
@@ -63,7 +64,7 @@ endif (USE_AVX)
 
 install(TARGETS openMVG_matching DESTINATION ${CMAKE_INSTALL_LIBDIR} EXPORT openMVG-targets)
 
-UNIT_TEST(openMVG matching "openMVG_matching")
+UNIT_TEST(openMVG matching "openMVG_matching;hwy")
 UNIT_TEST(openMVG matching_filters "openMVG_matching")
 UNIT_TEST(openMVG indMatch "openMVG_matching")
 UNIT_TEST(openMVG metric "openMVG_matching")
