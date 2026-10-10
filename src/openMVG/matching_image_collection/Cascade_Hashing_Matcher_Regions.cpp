@@ -27,8 +27,9 @@ using namespace openMVG::features;
 Cascade_Hashing_Matcher_Regions
 ::Cascade_Hashing_Matcher_Regions
 (
-  float distRatio
-):Matcher(), f_dist_ratio_(distRatio)
+  float distRatio,
+  bool mutual
+):Matcher(), f_dist_ratio_(distRatio), b_mutual_(mutual)
 {
 }
 
@@ -40,6 +41,7 @@ void Match
   const sfm::Regions_Provider & regions_provider,
   const Pair_Set & pairs,
   float fDistRatio,
+  bool bMutual,
   PairWiseMatchesContainer & map_PutativeMatches, // the pairwise photometric corresponding points
   system::ProgressInterface * my_progress_bar
 )
@@ -198,6 +200,38 @@ void Match
         vec_putative_matches.emplace_back(pvec_indices[index*2].j_, pvec_indices[index*2].i_);
       }
 
+      if (bMutual)
+      {
+        // Match the descriptors of I to those of J too, and keep the matches
+        // found both ways.
+        IndMatches reverse_indices;
+        std::vector<ResultType> reverse_distances;
+        reverse_distances.reserve(regionsI->RegionCount() * 2);
+        reverse_indices.reserve(regionsI->RegionCount() * 2);
+        cascade_hasher.Match_HashedDescriptions<BaseMat, ResultType>(
+          hashed_base_[I], mat_I,
+          hashed_base_[J], mat_J,
+          &reverse_indices, &reverse_distances);
+
+        std::vector<int> reverse_nn_ratio_idx;
+        matching::NNdistanceRatio(
+          reverse_distances.begin(),
+          reverse_distances.end(),
+          2,
+          reverse_nn_ratio_idx,
+          Square(fDistRatio));
+
+        matching::IndMatches reverse_matches;
+        reverse_matches.reserve(reverse_nn_ratio_idx.size());
+        for (const int index : reverse_nn_ratio_idx)
+        {
+          // (query index in I, database index in J)
+          reverse_matches.emplace_back(reverse_indices[index*2].i_, reverse_indices[index*2].j_);
+        }
+        vec_putative_matches = matching::MutualMatches(std::move(vec_putative_matches),
+                                                       std::move(reverse_matches));
+      }
+
       // Remove duplicates
       matching::IndMatch::getDeduplicated(vec_putative_matches);
 
@@ -249,6 +283,7 @@ void Cascade_Hashing_Matcher_Regions::Match
       *regions_provider.get(),
       pairs,
       f_dist_ratio_,
+      b_mutual_,
       map_PutativeMatches,
       my_progress_bar);
   }
@@ -259,6 +294,7 @@ void Cascade_Hashing_Matcher_Regions::Match
       *regions_provider.get(),
       pairs,
       f_dist_ratio_,
+      b_mutual_,
       map_PutativeMatches,
       my_progress_bar);
   }

@@ -144,7 +144,8 @@ int main(int argc, char **argv)
     "hnsw_l2",
     "ann_l2",
     "cascade_l2",
-    "fast_cascade_l2"
+    "fast_cascade_l2",
+    "gemm_l2"
   };
 
   OPENMVG_LOG_INFO << "Going to bench: ";
@@ -176,6 +177,8 @@ int main(int argc, char **argv)
       collectionMatcher.reset(new Matcher_Regions(fDistRatio, CASCADE_HASHING_L2));
     else if (method == "fast_cascade_l2")
       collectionMatcher.reset(new Cascade_Hashing_Matcher_Regions(fDistRatio));
+    else if (method == "gemm_l2")
+      collectionMatcher.reset(new Matcher_Regions(fDistRatio, GEMM_L2));
     else
       OPENMVG_LOG_ERROR << "Invalid Regions Matcher: " << method;
 

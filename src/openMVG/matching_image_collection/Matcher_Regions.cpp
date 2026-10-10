@@ -8,6 +8,8 @@
 
 #include "openMVG/matching_image_collection/Matcher_Regions.hpp"
 #include "openMVG/matching_image_collection/Matcher.hpp"
+#include "openMVG/matching/matcher_gemm.hpp"
+#include "openMVG/matching/matching_filters.hpp"
 #include "openMVG/matching/regions_matcher.hpp"
 #include "openMVG/sfm/pipelines/sfm_regions_provider.hpp"
 #include "openMVG/system/progressinterface.hpp"
@@ -21,13 +23,72 @@ using namespace openMVG::features;
 
 Matcher_Regions::Matcher_Regions
 (
-  float distRatio, EMatcherType eMatcherType
+  float distRatio, EMatcherType eMatcherType, bool mutual
 ):
   Matcher(),
   f_dist_ratio_(distRatio),
-  eMatcherType_(eMatcherType)
+  eMatcherType_(eMatcherType),
+  b_mutual_(mutual)
 {
 }
+
+namespace
+{
+// GEMM_L2: every pair is a single-threaded matrix product, so run the pairs
+// in parallel. Both directions come from the same pass, which makes the
+// mutual check free.
+void MatchGemm
+(
+  const sfm::Regions_Provider & regions_provider,
+  const Pair_Set & pairs,
+  float dist_ratio,
+  bool mutual,
+  PairWiseMatchesContainer & map_PutativeMatches,
+  system::ProgressInterface * my_progress_bar
+)
+{
+  const std::vector<Pair> pair_list(pairs.cbegin(), pairs.cend());
+#ifdef OPENMVG_USE_OPENMP
+  #pragma omp parallel for schedule(dynamic)
+#endif
+  for (int k = 0; k < static_cast<int>(pair_list.size()); ++k)
+  {
+    if (my_progress_bar->hasBeenCanceled())
+      continue;
+    const IndexT I = pair_list[k].first;
+    const IndexT J = pair_list[k].second;
+    const std::shared_ptr<features::Regions> regionsI = regions_provider.get(I);
+    const std::shared_ptr<features::Regions> regionsJ = regions_provider.get(J);
+    if (regionsI->RegionCount() == 0 || regionsJ->RegionCount() == 0
+        || regionsI->Type_id() != regionsJ->Type_id()
+        || !GemmDescriptors::IsSupported(*regionsI))
+    {
+      ++(*my_progress_bar);
+      continue;
+    }
+
+    // J is the query, I the database, as in the other matchers.
+    const GemmDescriptors descriptorsI(*regionsI), descriptorsJ(*regionsJ);
+    NearestNeighbours2 j_to_i, i_to_j;
+    GemmNearestNeighbours(descriptorsJ, descriptorsI, &j_to_i, mutual ? &i_to_j : nullptr);
+
+    IndMatches vec_putative_matches;
+    for (const IndMatch & m : DistanceRatioMatches(j_to_i, mutual ? &i_to_j : nullptr, dist_ratio))
+      vec_putative_matches.emplace_back(m.j_, m.i_);
+
+#ifdef OPENMVG_USE_OPENMP
+  #pragma omp critical
+#endif
+    {
+      if (!vec_putative_matches.empty())
+      {
+        map_PutativeMatches.insert( { {I,J}, std::move(vec_putative_matches) } );
+      }
+    }
+    ++(*my_progress_bar);
+  }
+}
+} // namespace
 
 void Matcher_Regions::Match(
   const std::shared_ptr<sfm::Regions_Provider> & regions_provider,
@@ -44,6 +105,13 @@ void Matcher_Regions::Match(
 #endif
 
   my_progress_bar->Restart(pairs.size(), "- Matching -");
+
+  if (eMatcherType_ == GEMM_L2)
+  {
+    MatchGemm(*regions_provider, pairs, f_dist_ratio_, b_mutual_,
+              map_PutativeMatches, my_progress_bar);
+    return;
+  }
 
   // Sort pairs according the first index to minimize the MatcherT build operations
   using Map_vectorT = std::map<IndexT, std::vector<IndexT>>;
@@ -90,7 +158,27 @@ void Matcher_Regions::Match(
       }
 
       IndMatches vec_putative_matches;
-      matcher->MatchDistanceRatio(f_dist_ratio_, *regionsJ.get(), vec_putative_matches);
+      if (b_mutual_ && matcher->HasNativeMutualMatching())
+      {
+        matcher->MatchDistanceRatioMutual(f_dist_ratio_, *regionsJ.get(), vec_putative_matches);
+      }
+      else
+      {
+        matcher->MatchDistanceRatio(f_dist_ratio_, *regionsJ.get(), vec_putative_matches);
+        if (b_mutual_ && !vec_putative_matches.empty())
+        {
+          // Match I against J too, and keep the matches found both ways.
+          IndMatches reverse_matches;
+          const std::unique_ptr<RegionsMatcher> reverse_matcher =
+            RegionMatcherFactory(eMatcherType_, *regionsJ.get());
+          if (reverse_matcher)
+            reverse_matcher->MatchDistanceRatio(f_dist_ratio_, *regionsI.get(), reverse_matches);
+          for (auto & match : reverse_matches) // (J, I) -> (I, J)
+            std::swap(match.i_, match.j_);
+          vec_putative_matches = MutualMatches(std::move(vec_putative_matches),
+                                               std::move(reverse_matches));
+        }
+      }
 
 #ifdef OPENMVG_USE_OPENMP
   #pragma omp critical

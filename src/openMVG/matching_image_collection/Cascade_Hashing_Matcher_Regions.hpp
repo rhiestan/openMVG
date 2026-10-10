@@ -29,9 +29,12 @@ namespace matching_image_collection {
 class Cascade_Hashing_Matcher_Regions : public Matcher
 {
   public:
+  /// If mutual, a match must also be the nearest neighbour (passing the
+  /// distance ratio test) when matching in the other direction.
   explicit Cascade_Hashing_Matcher_Regions
   (
-    float dist_ratio
+    float dist_ratio,
+    bool mutual = false
   );
 
   /// Find corresponding points between some pair of view Ids
@@ -45,6 +48,8 @@ class Cascade_Hashing_Matcher_Regions : public Matcher
   private:
   // Distance ratio used to discard spurious correspondence
   float f_dist_ratio_;
+  // Keep only mutual nearest neighbours
+  bool b_mutual_;
 };
 
 } // namespace matching_image_collection

@@ -64,6 +64,7 @@ int main( int argc, char** argv )
   cmd.add( make_option( 'n', sNearestMatchingMethod, "nearest_matching_method" ) );
   cmd.add( make_option( 'f', bForce, "force" ) );
   cmd.add( make_option( 'c', ui_max_cache_size, "cache_size" ) );
+  cmd.add( make_switch( 'm', "mutual" ) );
   // Pre-emptive matching
   cmd.add( make_option( 'P', ui_preemptive_feature_count, "preemptive_feature_count") );
 
@@ -93,6 +94,8 @@ int main( int argc, char** argv )
       << "    HNSWL1: L1 Approximate Matching with Hierarchical Navigable Small World graphs\n"
       << "      tailored for quantized and histogram based descriptors (e.g uint8 RootSIFT)\n"
       << "    ANNL2: L2 Approximate Nearest Neighbor matching,\n"
+      << "    GEMML2: L2 exact matching with matrix products\n"
+      << "      (same matches as BRUTEFORCEL2 for 8-bit descriptors, much faster),\n"
       << "    CASCADEHASHINGL2: L2 Cascade Hashing matching.\n"
       << "    FASTCASCADEHASHINGL2: (default)\n"
       << "      L2 Cascade Hashing with precomputed hashed regions\n"
@@ -100,6 +103,10 @@ int main( int argc, char** argv )
       << "  For Binary based descriptor:\n"
       << "    BRUTEFORCEHAMMING: BruteForce Hamming matching,\n"
       << "    HNSWHAMMING: Hamming Approximate Matching with Hierarchical Navigable Small World graphs\n"
+      << "[-m|--mutual]\n"
+      << "  Keep only mutual nearest neighbours: a match must also pass the\n"
+      << "  distance ratio test when matching in the other direction\n"
+      << "  (free with GEMML2, doubles the matching time otherwise).\n"
       << "[-c|--cache_size]\n"
       << "  Use a regions cache (only cache_size regions will be stored in memory)\n"
       << "  If not used, all regions will be load in memory."
@@ -121,6 +128,7 @@ int main( int argc, char** argv )
             << "--force " << bForce << "\n"
             << "--ratio " << fDistRatio << "\n"
             << "--nearest_matching_method " << sNearestMatchingMethod << "\n"
+            << "--mutual " << cmd.used('m') << "\n"
             << "--cache_size " << ((ui_max_cache_size == 0) ? "unlimited" : std::to_string(ui_max_cache_size)) << "\n"
             << "--preemptive_feature_used/count " << cmd.used('P') << " / " << ui_preemptive_feature_count;
   if (cmd.used('P'))
@@ -230,66 +238,73 @@ int main( int argc, char** argv )
   {
     // Allocate the right Matcher according the Matching requested method
     std::unique_ptr<Matcher> collectionMatcher;
+    const bool bMutual = cmd.used('m');
     if ( sNearestMatchingMethod == "AUTO" )
     {
       if ( regions_type->IsScalar() )
       {
         OPENMVG_LOG_INFO << "Using FAST_CASCADE_HASHING_L2 matcher";
-        collectionMatcher.reset(new Cascade_Hashing_Matcher_Regions(fDistRatio));
+        collectionMatcher.reset(new Cascade_Hashing_Matcher_Regions(fDistRatio, bMutual));
       }
       else
       if (regions_type->IsBinary())
       {
         OPENMVG_LOG_INFO << "Using HNSWHAMMING matcher";
-        collectionMatcher.reset(new Matcher_Regions(fDistRatio, HNSW_HAMMING));
+        collectionMatcher.reset(new Matcher_Regions(fDistRatio, HNSW_HAMMING, bMutual));
       }
     }
     else
     if (sNearestMatchingMethod == "BRUTEFORCEL2")
     {
       OPENMVG_LOG_INFO << "Using BRUTE_FORCE_L2 matcher";
-      collectionMatcher.reset(new Matcher_Regions(fDistRatio, BRUTE_FORCE_L2));
+      collectionMatcher.reset(new Matcher_Regions(fDistRatio, BRUTE_FORCE_L2, bMutual));
     }
     else
     if (sNearestMatchingMethod == "BRUTEFORCEHAMMING")
     {
       OPENMVG_LOG_INFO << "Using BRUTE_FORCE_HAMMING matcher";
-      collectionMatcher.reset(new Matcher_Regions(fDistRatio, BRUTE_FORCE_HAMMING));
+      collectionMatcher.reset(new Matcher_Regions(fDistRatio, BRUTE_FORCE_HAMMING, bMutual));
     }
     else
     if (sNearestMatchingMethod == "HNSWL2")
     {
       OPENMVG_LOG_INFO << "Using HNSWL2 matcher";
-      collectionMatcher.reset(new Matcher_Regions(fDistRatio, HNSW_L2));
+      collectionMatcher.reset(new Matcher_Regions(fDistRatio, HNSW_L2, bMutual));
     }
     if (sNearestMatchingMethod == "HNSWL1")
     {
       OPENMVG_LOG_INFO << "Using HNSWL1 matcher";
-      collectionMatcher.reset(new Matcher_Regions(fDistRatio, HNSW_L1));
+      collectionMatcher.reset(new Matcher_Regions(fDistRatio, HNSW_L1, bMutual));
     }
     else
     if (sNearestMatchingMethod == "HNSWHAMMING")
     {
       OPENMVG_LOG_INFO << "Using HNSWHAMMING matcher";
-      collectionMatcher.reset(new Matcher_Regions(fDistRatio, HNSW_HAMMING));
+      collectionMatcher.reset(new Matcher_Regions(fDistRatio, HNSW_HAMMING, bMutual));
     }
     else
     if (sNearestMatchingMethod == "ANNL2")
     {
       OPENMVG_LOG_INFO << "Using ANN_L2 matcher";
-      collectionMatcher.reset(new Matcher_Regions(fDistRatio, ANN_L2));
+      collectionMatcher.reset(new Matcher_Regions(fDistRatio, ANN_L2, bMutual));
+    }
+    else
+    if (sNearestMatchingMethod == "GEMML2")
+    {
+      OPENMVG_LOG_INFO << "Using GEMM_L2 matcher";
+      collectionMatcher.reset(new Matcher_Regions(fDistRatio, GEMM_L2, bMutual));
     }
     else
     if (sNearestMatchingMethod == "CASCADEHASHINGL2")
     {
       OPENMVG_LOG_INFO << "Using CASCADE_HASHING_L2 matcher";
-      collectionMatcher.reset(new Matcher_Regions(fDistRatio, CASCADE_HASHING_L2));
+      collectionMatcher.reset(new Matcher_Regions(fDistRatio, CASCADE_HASHING_L2, bMutual));
     }
     else
     if (sNearestMatchingMethod == "FASTCASCADEHASHINGL2")
     {
       OPENMVG_LOG_INFO << "Using FAST_CASCADE_HASHING_L2 matcher";
-      collectionMatcher.reset(new Cascade_Hashing_Matcher_Regions(fDistRatio));
+      collectionMatcher.reset(new Cascade_Hashing_Matcher_Regions(fDistRatio, bMutual));
     }
     if (!collectionMatcher)
     {

@@ -20,7 +20,8 @@ enum EMatcherType : unsigned char
   HNSW_L2,
   HNSW_L1,
   BRUTE_FORCE_HAMMING,
-  HNSW_HAMMING
+  HNSW_HAMMING,
+  GEMM_L2  // exact L2 matching with matrix products, see matcher_gemm.hpp
 };
 
 } // namespace matching

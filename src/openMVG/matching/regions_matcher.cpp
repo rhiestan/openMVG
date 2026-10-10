@@ -9,6 +9,7 @@
 #include "openMVG/matching/regions_matcher.hpp"
 #include "openMVG/matching/matcher_brute_force.hpp"
 #include "openMVG/matching/matcher_cascade_hashing.hpp"
+#include "openMVG/matching/matcher_gemm.hpp"
 #include "openMVG/matching/matcher_kdtree_flann.hpp"
 #include "openMVG/matching/matcher_hnsw.hpp"
 #include "openMVG/matching/metric.hpp"
@@ -107,6 +108,9 @@ std::unique_ptr<RegionsMatcher> RegionMatcherFactory
           region_matcher.reset(new matching::RegionsMatcherT<MatcherT>(regions, true));
         }
         break;
+        case GEMM_L2:
+          region_matcher.reset(new matching::RegionsMatcherGemmL2(regions));
+        break;
         default:
           OPENMVG_LOG_ERROR << "Using unknown matcher type";
       }
@@ -143,6 +147,9 @@ std::unique_ptr<RegionsMatcher> RegionMatcherFactory
           using MatcherT = ArrayMatcherCascadeHashing<float, MetricT>;
           region_matcher.reset(new matching::RegionsMatcherT<MatcherT>(regions, true));
         }
+        break;
+        case GEMM_L2:
+          region_matcher.reset(new matching::RegionsMatcherGemmL2(regions));
         break;
         default:
           OPENMVG_LOG_ERROR << "Using unknown matcher type";

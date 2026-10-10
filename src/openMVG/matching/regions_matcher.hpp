@@ -81,6 +81,30 @@ class RegionsMatcher
     const features::Regions & query_regions,
     matching::IndMatches & vec_putative_matches
   ) = 0;
+
+  /**
+   * @brief True if MatchDistanceRatioMutual is implemented, i.e. the matcher
+   * finds the mutual nearest neighbours by itself, without a second matcher
+   * built on the query regions.
+   */
+  virtual bool HasNativeMutualMatching() const { return false; }
+
+  /**
+   * @brief As MatchDistanceRatio, but a match is kept only if the query
+   * region is also the nearest neighbour of the database region among the
+   * query regions, passing the distance ratio test in that direction too.
+   * Only available if HasNativeMutualMatching().
+   */
+  virtual bool MatchDistanceRatioMutual
+  (
+    const float /*dist_ratio*/,
+    const features::Regions & /*query_regions*/,
+    matching::IndMatches & vec_putative_matches
+  )
+  {
+    vec_putative_matches.clear();
+    return false;
+  }
 };
 
 /**

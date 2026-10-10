@@ -94,6 +94,32 @@ inline void SymmetricMatches
 }
 
 /**
+  * Mutual matches filtering:
+  * Keep the matches of `matches` that also appear in `reverse_matches`, both
+  * given as (left index, right index). When each list holds the nearest
+  * neighbour matches of one direction, these are the mutual nearest neighbours.
+  *
+  * \param[in]  matches          matches from A to B, as (index in A, index in B).
+  * \param[in]  reverse_matches  matches from B to A, as (index in A, index in B).
+  *
+  * \return the matches present in both lists, sorted.
+  */
+inline IndMatches MutualMatches
+(
+  IndMatches matches,
+  IndMatches reverse_matches
+)
+{
+  std::sort(matches.begin(), matches.end());
+  std::sort(reverse_matches.begin(), reverse_matches.end());
+  IndMatches mutual;
+  std::set_intersection(matches.cbegin(), matches.cend(),
+                        reverse_matches.cbegin(), reverse_matches.cend(),
+                        std::back_inserter(mutual));
+  return mutual;
+}
+
+/**
   * Intersect two container via Iterator.
   * Keep element that exist in the two sequence of data.
   *

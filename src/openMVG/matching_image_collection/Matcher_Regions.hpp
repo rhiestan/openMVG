@@ -28,10 +28,13 @@ namespace matching_image_collection {
 class Matcher_Regions : public Matcher
 {
   public:
+  /// If mutual, a match must also be the nearest neighbour (passing the
+  /// distance ratio test) when matching in the other direction.
   Matcher_Regions
   (
     float dist_ratio,
-    matching::EMatcherType eMatcherType
+    matching::EMatcherType eMatcherType,
+    bool mutual = false
   );
 
   /// Find corresponding points between some pair of view Ids
@@ -48,6 +51,8 @@ class Matcher_Regions : public Matcher
   float f_dist_ratio_;
   // Matcher Type
   matching::EMatcherType eMatcherType_;
+  // Keep only mutual nearest neighbours
+  bool b_mutual_;
 };
 
 } // namespace matching_image_collection
