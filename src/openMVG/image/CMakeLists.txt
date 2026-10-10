@@ -33,9 +33,9 @@ target_include_directories(openMVG_image
     ${PNG_INCLUDE_DIRS}
     ${TIFF_INCLUDE_DIR}
 )
-if (MSVC)
+if (WIN32) # MSVC, clang-cl and clang targeting the MSVC runtime
   target_compile_options(openMVG_image PUBLIC "-DNOMINMAX")
-endif (MSVC)
+endif (WIN32)
 set_target_properties(openMVG_image PROPERTIES SOVERSION ${OPENMVG_VERSION_MAJOR} VERSION "${OPENMVG_VERSION_MAJOR}.${OPENMVG_VERSION_MINOR}")
 set_property(TARGET openMVG_image PROPERTY FOLDER OpenMVG/OpenMVG)
 install(TARGETS openMVG_image DESTINATION ${CMAKE_INSTALL_LIBDIR} EXPORT openMVG-targets)

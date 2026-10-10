@@ -263,7 +263,7 @@ typedef struct {
 #define LOGLUV_PUBLIC 1
 #endif
 
-#if !defined(__GNUC__) && !defined(__attribute__)
+#if !defined(__GNUC__) && !defined(__clang__) && !defined(__attribute__)
 #  define __attribute__(x) /*nothing*/
 #endif
 
