@@ -7,3 +7,10 @@ Local modifications:
 
   * Use minilog to avoid using glog
   * Remove automatic headers search to limit to openMVG libraries scope
+  * The EIGEN_SPARSE sparse linear algebra library (internal/ceres/eigensparse.cc)
+    uses Eigen::SupernodalLDLT from DirectLUSolvers (third_party/DirectLUSolvers)
+    instead of Eigen::SimplicialLDLT. SparseCholesky::Create takes the linear
+    solver's num_threads, which the factorization uses through OpenMP when
+    ceres is built with OpenMP. openMVG_ceres is compiled as C++17.
+  * schur_eliminator_impl.h: std::random_shuffle (removed in C++17) replaced
+    by std::shuffle.

@@ -1,0 +1,10 @@
+Project: DirectLUSolvers
+URL: https://github.com/rhiestan/DirectLUSolvers
+License: Mozilla Public License 2.0
+Upstream commit: c6ec85033e2a4024ac077fea883f1f91f5332349 (with the local working-tree changes of the time)
+
+Header-only sparse direct solvers for Eigen. Only src/ is vendored.
+
+Used by the internal ceres-solver (internal/ceres/eigensparse.cc): the
+EIGEN_SPARSE sparse linear algebra library type is backed by
+Eigen::SupernodalLDLT instead of Eigen::SimplicialLDLT.

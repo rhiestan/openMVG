@@ -54,6 +54,7 @@
 
 #include <algorithm>
 #include <map>
+#include <random>
 #include "ceres/block_random_access_matrix.h"
 #include "ceres/block_sparse_matrix.h"
 #include "ceres/block_structure.h"
@@ -153,7 +154,8 @@ void SchurEliminator<kRowBlockSize, kEBlockSize, kFBlockSize>::Init(
 
   uneliminated_row_begins_ = chunk.start + chunk.size;
   if (num_threads_ > 1) {
-    random_shuffle(chunks_.begin(), chunks_.end());
+    // openMVG: std::random_shuffle was removed in C++17.
+    std::shuffle(chunks_.begin(), chunks_.end(), std::mt19937());
   }
 
   buffer_.reset(new double[buffer_size_ * num_threads_]);

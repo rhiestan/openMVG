@@ -39,7 +39,8 @@ namespace internal {
 
 SparseCholesky* SparseCholesky::Create(
     SparseLinearAlgebraLibraryType sparse_linear_algebra_library_type,
-    OrderingType ordering_type) {
+    OrderingType ordering_type,
+    int num_threads) {
   switch (sparse_linear_algebra_library_type) {
     case SUITE_SPARSE:
 #ifndef CERES_NO_SUITESPARSE
@@ -51,10 +52,10 @@ SparseCholesky* SparseCholesky::Create(
 
     case EIGEN_SPARSE:
 #ifdef CERES_USE_EIGEN_SPARSE
-      return EigenSparseCholesky::Create(ordering_type);
+      return EigenSparseCholesky::Create(ordering_type, num_threads);
 #else
       LOG(FATAL) << "Ceres was compiled without support for "
-                 << "Eigen's sparse Cholesky factorization routines.";
+                 << "the EIGEN_SPARSE (DirectLUSolvers) factorization.";
       return NULL;
 #endif
 

@@ -28,7 +28,8 @@
 //
 // Author: sameeragarwal@google.com (Sameer Agarwal)
 //
-// A simple C++ interface to the Eigen's Sparse Cholesky routines.
+// A simple C++ interface to a sparse LDL^T factorization of Eigen matrices.
+// openMVG: backed by Eigen::SupernodalLDLT from DirectLUSolvers.
 
 #ifndef CERES_INTERNAL_EIGENSPARSE_H_
 #define CERES_INTERNAL_EIGENSPARSE_H_
@@ -49,7 +50,8 @@ namespace internal {
 class EigenSparseCholesky : public SparseCholesky {
  public:
   // Factory
-  static EigenSparseCholesky* Create(const OrderingType ordering_type);
+  static EigenSparseCholesky* Create(const OrderingType ordering_type,
+                                     int num_threads = 1);
 
   // SparseCholesky interface.
   virtual ~EigenSparseCholesky();

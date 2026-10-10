@@ -1,0 +1,98 @@
+// SupernodalLU - a sparse direct LU solver for Eigen, using the supernodal
+// block algorithms popularized by PaStiX (see pastix_algorithms.md).
+//
+// This header defines the structural building blocks shared by the analysis
+// (symbolic) and factorization (numeric) phases. Names are intentionally
+// descriptive and do NOT follow the original PaStiX naming.
+//
+// This Source Code Form is licensed under the Mozilla Public License v.2.0,
+// matching the surrounding Eigen code it integrates with.
+
+#ifndef SUPERNODAL_LU_SUPPORT_H
+#define SUPERNODAL_LU_SUPPORT_H
+
+#include <Eigen/SparseCore>
+
+#include <vector>
+
+namespace Eigen {
+namespace supernodal_lu {
+
+// A supernode is a maximal range of consecutive columns (in the internal,
+// fill-reducing + postordered numbering) that share the same below-diagonal
+// row structure. It is factored and updated as one dense panel.
+//
+// Storage convention for a supernode of width w with `offDiagonalRowCount`
+// rows below the diagonal:
+//   * diagonal block : w x w   (packed LU: unit-lower L_kk and upper U_kk)
+//   * lower panel    : offDiagonalRowCount x w   (the L entries below diag)
+//   * upper panel    : w x offDiagonalRowCount   (the U entries to the right)
+// The lower panel rows and the upper panel columns are indexed by the same
+// ordered set of off-diagonal rows (the matrix pattern is symmetric).
+template <typename StorageIndex>
+struct Supernode {
+  StorageIndex firstColumn = 0;        // inclusive, internal index
+  StorageIndex lastColumn = 0;         // inclusive, internal index
+  StorageIndex firstRowBlock = 0;      // index into the flattened row-block array
+  StorageIndex rowBlockCount = 0;      // number of off-diagonal row blocks
+  StorageIndex offDiagonalRowCount = 0;  // total rows below the diagonal
+
+  StorageIndex width() const { return lastColumn - firstColumn + 1; }
+};
+
+// A contiguous range of off-diagonal rows of one supernode that all fall within
+// the columns of a single other supernode ("the facing supernode"). This is the
+// unit of dense BLAS work during the numeric update.
+template <typename StorageIndex>
+struct RowBlock {
+  StorageIndex firstRow = 0;        // inclusive, internal index
+  StorageIndex lastRow = 0;         // inclusive, internal index
+  StorageIndex facingSupernode = 0;  // supernode whose columns contain these rows
+  StorageIndex panelOffset = 0;      // start position within the owner's off-diagonal ordering
+
+  StorageIndex height() const { return lastRow - firstRow + 1; }
+};
+
+// Identifies, for a target supernode, one source supernode that contributes a
+// Schur-complement update to it, together with the source's row block that
+// faces the target.
+template <typename StorageIndex>
+struct UpdateSource {
+  StorageIndex sourceSupernode = 0;
+  StorageIndex facingRowBlock = 0;  // index (global) of the facing block in the source
+};
+
+// How to permute large entries onto the diagonal before the symbolic analysis.
+//
+//   None         no row permutation at all.
+//   Transversal  a maximum transversal that prefers large entries: a
+//                magnitude-greedy seed completed by augmenting paths. Cheap
+//                (near-linear in practice), but the augmenting phase optimizes
+//                only for COMPLETING the transversal, so it can displace good
+//                diagonal entries and is not guaranteed to beat the identity.
+//   MC64         the exact maximum-product assignment (Duff & Koster), which
+//                additionally yields dual scaling factors making every matched
+//                diagonal entry exactly 1 and no entry larger than 1. Costs
+//                O(n) shortest-path searches, so it is opt-in.
+enum class MatchingMethod { None, Transversal, MC64 };
+
+// Runs a fill-reducing ordering functor on `matrix`, compressing a copy first
+// when the input is uncompressed (reserve + insert). Eigen's COLAMDOrdering
+// reads the index arrays directly and requires compressed storage; it only
+// asserts that in debug builds, so in release an uncompressed input silently
+// corrupts the heap. Compressed inputs -- the common case -- pay no copy.
+template <typename OrderingType, typename MatrixType, typename PermutationType>
+void orderCompressed(OrderingType& ordering, const MatrixType& matrix, PermutationType& perm) {
+  if (matrix.isCompressed()) {
+    ordering(matrix, perm);
+    return;
+  }
+  typename MatrixType::PlainObject compressed(matrix);
+  compressed.makeCompressed();
+  ordering(compressed, perm);
+}
+
+}  // namespace supernodal_lu
+}  // namespace Eigen
+
+#endif  // SUPERNODAL_LU_SUPPORT_H

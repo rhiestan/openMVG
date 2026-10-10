@@ -184,11 +184,11 @@ if (EIGEN_FOUND)
   message("   ===============================================================")
   if (EIGENSPARSE)
     list(APPEND CERES_COMPILE_OPTIONS CERES_USE_EIGEN_SPARSE)
-    message("   Enabling the use of Eigen as a sparse linear algebra library ")
-    message("   for solving the nonlinear least squares problems. Enabling ")
-    message("   this option results in an LGPL licensed version of ")
-    message("   Ceres Solver as the Simplicial Cholesky factorization in Eigen")
-    message("   is licensed under the LGPL. ")
+    message("   Enabling EIGEN_SPARSE as a sparse linear algebra library ")
+    message("   for solving the nonlinear least squares problems. ")
+    message("   openMVG: it is implemented with the supernodal LDL^T ")
+    message("   factorization of DirectLUSolvers (MPL2), see ")
+    message("   third_party/DirectLUSolvers. ")
 
     if (EIGEN_VERSION VERSION_LESS 3.2.2)
       message("   WARNING:")
@@ -489,6 +489,10 @@ include_directories(
 # used by clients after find_package(Ceres) does not identify Eigen as
 # as system headers.
 include_directories(SYSTEM ${EIGEN_INCLUDE_DIRS})
+# openMVG: header-only sparse direct solvers backing EIGEN_SPARSE.
+if (EIGENSPARSE)
+  include_directories(SYSTEM ${CMAKE_CURRENT_SOURCE_DIR}/../DirectLUSolvers/src)
+endif (EIGENSPARSE)
 
 if (SUITESPARSE)
   include_directories(${SUITESPARSE_INCLUDE_DIRS})

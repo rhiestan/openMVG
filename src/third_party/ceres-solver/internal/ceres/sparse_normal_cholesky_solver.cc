@@ -52,7 +52,8 @@ SparseNormalCholeskySolver::SparseNormalCholeskySolver(
     : options_(options) {
   sparse_cholesky_.reset(
       SparseCholesky::Create(options_.sparse_linear_algebra_library_type,
-                             options_.use_postordering ? AMD : NATURAL));
+                             options_.use_postordering ? AMD : NATURAL,
+                             options_.num_threads));
 }
 
 SparseNormalCholeskySolver::~SparseNormalCholeskySolver() {}

@@ -67,12 +67,14 @@ class SparseCholesky {
  public:
   // Factory which returns an instance of SparseCholesky for the given
   // sparse linear algebra library and fill reducing ordering
-  // strategy.
+  // strategy. num_threads is the number of threads the factorization may
+  // use; backends that are not multithreaded ignore it.
   //
   // Caller owns the result.
   static SparseCholesky* Create(
       SparseLinearAlgebraLibraryType sparse_linear_algebra_library_type,
-      OrderingType ordering_type);
+      OrderingType ordering_type,
+      int num_threads = 1);
 
   virtual ~SparseCholesky();
 

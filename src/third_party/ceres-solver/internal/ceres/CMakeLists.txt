@@ -197,6 +197,8 @@ if (MINIGLOG)
 endif (MINIGLOG)
 
 add_library(openMVG_ceres STATIC ${CERES_LIBRARY_SOURCE})
+# openMVG: DirectLUSolvers (EIGEN_SPARSE backend) requires C++17.
+target_compile_features(openMVG_ceres PRIVATE cxx_std_17)
 set_target_properties(openMVG_ceres PROPERTIES
   VERSION ${CERES_VERSION}
   SOVERSION ${CERES_VERSION_MAJOR})
