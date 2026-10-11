@@ -23,6 +23,8 @@
 
 #include "hwy/targets.h"
 
+#include <bitset>
+
 #include <iostream>
 #include <random>
 
@@ -383,6 +385,73 @@ TEST(Matching, GemmNearestNeighbours_Empty)
   GemmNearestNeighbours(single, single, &a_to_b, nullptr);
   EXPECT_EQ(0, a_to_b.index[0]);
   EXPECT_TRUE(DistanceRatioMatches(a_to_b, nullptr, 0.8f).empty());
+}
+
+TEST(Matching, CascadeHashing_GatherCandidates_AllTargets)
+{
+  std::mt19937_64 rng(5);
+  const int nb_database = 50;
+  for (const int nb_words : {1, 2, 3})
+  {
+    // Hash codes of the database, a query, and 3 ranges of candidates with
+    // duplicates (ids drawn from a small database).
+    std::vector<uint64_t> database(nb_database * nb_words), query(nb_words);
+    for (auto & w : database) w = rng();
+    for (auto & w : query) w = rng();
+    std::vector<std::vector<int>> ranges = {{}, {}, {}};
+    std::vector<std::vector<uint64_t>> range_codes(3);
+    for (int r = 0; r < 3; ++r)
+    {
+      const int count = r == 0 ? 0 : 20 + 13 * r;
+      for (int k = 0; k < count; ++k)
+      {
+        const int id = static_cast<int>(rng() % nb_database);
+        ranges[r].push_back(id);
+        range_codes[r].insert(range_codes[r].end(),
+          database.begin() + id * nb_words, database.begin() + (id + 1) * nb_words);
+      }
+    }
+    const int * members[3] = {ranges[0].data(), ranges[1].data(), ranges[2].data()};
+    const uint64_t * codes[3] = {range_codes[0].data(), range_codes[1].data(), range_codes[2].data()};
+    const int counts[3] = {int(ranges[0].size()), int(ranges[1].size()), int(ranges[2].size())};
+    const int total = counts[0] + counts[1] + counts[2];
+
+    // Reference: distinct ids in order of first appearance.
+    std::vector<int> expected_ids, expected_distances, expected_histogram(nb_words * 64 + 1, 0);
+    std::vector<bool> seen(nb_database, false);
+    for (int r = 0; r < 3; ++r)
+      for (const int id : ranges[r])
+      {
+        if (seen[id]) continue;
+        seen[id] = true;
+        int distance = 0;
+        for (int w = 0; w < nb_words; ++w)
+          distance += static_cast<int>(std::bitset<64>(query[w] ^ database[id * nb_words + w]).count());
+        expected_ids.push_back(id);
+        expected_distances.push_back(distance);
+        ++expected_histogram[distance];
+      }
+
+    for (const int64_t target : hwy::SupportedAndGeneratedTargets())
+    {
+      hwy::SetSupportedTargetsForTest(target);
+      // Marks of a previous query (7) must not count as seen for query 8.
+      std::vector<int> last_query(nb_database, 7);
+      std::vector<int> histogram(nb_words * 64 + 1, 0), ids(total, -1), distances(total, -1);
+      const int nb = internal::GetGatherCandidatesFunction()(
+        query.data(), nb_words, 3, members, codes, counts, 8,
+        last_query.data(), histogram.data(), ids.data(), distances.data());
+      ids.resize(nb);
+      distances.resize(nb);
+      const bool same = ids == expected_ids && distances == expected_distances &&
+        histogram == expected_histogram;
+      EXPECT_TRUE(same);
+      if (!same)
+        std::cout << "GatherCandidates target " << internal::GatherCandidatesTargetName()
+          << " differs (" << nb_words << " words)" << std::endl;
+    }
+    hwy::SetSupportedTargetsForTest(0);  // back to the best target
+  }
 }
 
 /* ************************************************************************* */

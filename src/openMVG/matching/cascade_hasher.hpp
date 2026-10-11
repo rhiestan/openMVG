@@ -62,13 +62,13 @@
 
 
 #include <algorithm>
-#include <bitset>
 #include <cmath>
 #include <cstdint>
 #include <random>
 #include <utility>
 #include <vector>
 
+#include "openMVG/matching/cascade_hasher_hwy.hpp"
 #include "openMVG/matching/indMatch.hpp"
 #include "openMVG/matching/metric.hpp"
 #include "openMVG/numeric/eigen_alias_definition.hpp"
@@ -323,41 +323,23 @@ public:
     const int NN = 2
   ) const
   {
-    // Hash codes of 128 bits (the default) get a specialized loop.
-    if (hashed_descriptions1.nb_hash_words == 2)
-      Match_HashedDescriptions<2>(hashed_descriptions1, descriptions1,
-        hashed_descriptions2, descriptions2, pvec_indices, pvec_distances, NN);
-    else
-      Match_HashedDescriptions<0>(hashed_descriptions1, descriptions1,
-        hashed_descriptions2, descriptions2, pvec_indices, pvec_distances, NN);
-  }
-
-  private:
-  // kHashWords: number of 64-bit words of the hash codes, or 0 if given at
-  // run time by the hashed descriptions.
-  template <int kHashWords, typename MatrixT, typename DistanceType>
-  void Match_HashedDescriptions
-  (
-    const HashedDescriptions& hashed_descriptions1,
-    const MatrixT & descriptions1,
-    const HashedDescriptions& hashed_descriptions2,
-    const MatrixT & descriptions2,
-    IndMatches * pvec_indices,
-    std::vector<DistanceType> * pvec_distances,
-    const int NN
-  ) const
-  {
     using MetricT = L2<typename MatrixT::Scalar>;
     MetricT metric;
 
     static const int kNumTopCandidates = 10;
 
-    const int nb_hash_words =
-      kHashWords > 0 ? kHashWords : hashed_descriptions1.nb_hash_words;
+    const int nb_hash_words = hashed_descriptions1.nb_hash_words;
+    const internal::GatherCandidatesFunction gather_candidates =
+      internal::GetGatherCandidatesFunction();
     // Local copies: the loop below stores to int arrays, which could alias
     // the members and force reloads.
     const int nb_hash_code = nb_hash_code_;
     const int nb_bucket_groups = nb_bucket_groups_;
+
+    // The buckets of the current query: members, hash codes and sizes.
+    std::vector<const int *> bucket_members(nb_bucket_groups);
+    std::vector<const uint64_t *> bucket_codes(nb_bucket_groups);
+    std::vector<int> bucket_sizes(nb_bucket_groups);
 
     // Distinct candidates of the current query, in order of first appearance:
     // descriptor ids and hamming distances.
@@ -377,8 +359,6 @@ public:
 
     for (int i = 0; i < hashed_descriptions1.nb_descriptions; ++i)
     {
-      candidate_ids.clear();
-      candidate_hamming_distances.clear();
       candidate_euclidean_distances.clear();
 
       const uint64_t * hash_code = hashed_descriptions1.hash_code(i);
@@ -391,23 +371,21 @@ public:
       for (int j = 0; j < nb_bucket_groups; ++j)
       {
         const auto bucket = hashed_descriptions2.bucket(j, bucket_ids[j]);
-        nb_candidates += bucket.second - bucket.first;
-        const uint64_t * candidate_hash_code =
-          hashed_descriptions2.bucket_hash_code(bucket.first);
-        for (const int * it = bucket.first; it != bucket.second;
-          ++it, candidate_hash_code += nb_hash_words)
-        {
-          const int candidate_id = *it;
-          if (last_query[candidate_id] == i)
-            continue;
-          last_query[candidate_id] = i;
-          const int hamming_distance = HammingDistance(
-            hash_code, candidate_hash_code, nb_hash_words);
-          ++num_descriptors_with_hamming_distance[hamming_distance];
-          candidate_ids.push_back(candidate_id);
-          candidate_hamming_distances.push_back(hamming_distance);
-        }
+        bucket_members[j] = bucket.first;
+        bucket_codes[j] = hashed_descriptions2.bucket_hash_code(bucket.first);
+        bucket_sizes[j] = static_cast<int>(bucket.second - bucket.first);
+        nb_candidates += bucket_sizes[j];
       }
+      if (candidate_ids.size() < nb_candidates)
+      {
+        candidate_ids.resize(nb_candidates);
+        candidate_hamming_distances.resize(nb_candidates);
+      }
+      const int nb_distinct_candidates = gather_candidates(
+        hash_code, nb_hash_words, nb_bucket_groups,
+        bucket_members.data(), bucket_codes.data(), bucket_sizes.data(),
+        i, last_query.data(), num_descriptors_with_hamming_distance.data(),
+        candidate_ids.data(), candidate_hamming_distances.data());
 
       // Find the hamming distance threshold of the k best candidates: all
       // candidates closer than it, and the first num_at_threshold found at it.
@@ -419,8 +397,8 @@ public:
         num_at_threshold -= num_descriptors_with_hamming_distance[threshold];
         ++threshold;
       }
-      for (const int hamming_distance : candidate_hamming_distances)
-        num_descriptors_with_hamming_distance[hamming_distance] = 0;
+      for (int k = 0; k < nb_distinct_candidates; ++k)
+        num_descriptors_with_hamming_distance[candidate_hamming_distances[k]] = 0;
 
       // Skip matching this descriptor if there are not at least NN candidates.
       if (nb_candidates <= static_cast<size_t>(NN))
@@ -430,7 +408,7 @@ public:
 
       // Compute the euclidean distance of the k descriptors with the best
       // hamming distance.
-      for (size_t k = 0; k < candidate_ids.size(); ++k)
+      for (int k = 0; k < nb_distinct_candidates; ++k)
       {
         const int hamming_distance = candidate_hamming_distances[k];
         if (hamming_distance > threshold ||
@@ -463,19 +441,7 @@ public:
     }
   }
 
-  static int HammingDistance
-  (
-    const uint64_t * a,
-    const uint64_t * b,
-    int nb_words
-  )
-  {
-    int distance = 0;
-    for (int k = 0; k < nb_words; ++k)
-      distance += static_cast<int>(std::bitset<64>(a[k] ^ b[k]).count());
-    return distance;
-  }
-
+  private:
   // Primary hashing function.
   Eigen::MatrixXf primary_hash_projection_;
 
