@@ -107,7 +107,7 @@ int main( int argc, char** argv )
       << "[-m|--mutual]\n"
       << "  Keep only mutual nearest neighbours: a match must also pass the\n"
       << "  distance ratio test when matching in the other direction\n"
-      << "  (free with GEMML2, doubles the matching time otherwise).\n"
+      << "  (free with GEMML2, adds the matching in the other direction otherwise).\n"
       << "[-c|--cache_size]\n"
       << "  Use a regions cache (only cache_size regions will be stored in memory)\n"
       << "  If not used, all regions will be load in memory."
