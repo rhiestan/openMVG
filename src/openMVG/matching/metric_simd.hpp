@@ -21,6 +21,12 @@
 #include <immintrin.h>
 #endif
 
+// SSE2 is part of the baseline instruction set of x86-64
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#define OPENMVG_HAS_SSE2
+#include <emmintrin.h>
+#endif
+
 namespace openMVG {
 namespace matching {
 
@@ -66,6 +72,39 @@ inline int L2_AVX2
   return _mm_extract_epi32(r, 0) + _mm_extract_epi32(r, 1);
 }
 #endif // OPENMVG_USE_AVX2
+
+#ifdef OPENMVG_HAS_SSE2
+// size must be a multiple of 16
+inline int L2_SSE2
+(
+  const uint8_t * a,
+  const uint8_t * b,
+  size_t size
+)
+{
+  // Accumulator
+  __m128i acc (_mm_setzero_si128());
+
+  // Compute (A-B) * (A-B) on 16 components per iteration
+  for (size_t j = 0; j < size; j += 16)
+  {
+    const __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + j));
+    const __m128i vb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + j));
+    // Absolute differences, without overflow
+    const __m128i d = _mm_sub_epi8(_mm_max_epu8(va, vb), _mm_min_epu8(va, vb));
+
+    __m128i dl = _mm_unpacklo_epi8(d, _mm_setzero_si128());
+    dl = _mm_madd_epi16(dl, dl);
+    __m128i dh = _mm_unpackhi_epi8(d, _mm_setzero_si128());
+    dh = _mm_madd_epi16(dh, dh);
+    acc = _mm_add_epi32(acc, _mm_add_epi32(dl, dh));
+  }
+  // Compute the sum in the accumulator
+  acc = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, _MM_SHUFFLE(1, 0, 3, 2)));
+  acc = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, _MM_SHUFFLE(2, 3, 0, 1)));
+  return _mm_cvtsi128_si32(acc);
+}
+#endif // OPENMVG_HAS_SSE2
 
 #ifdef OPENMVG_USE_AVX
 inline float L2_AVX

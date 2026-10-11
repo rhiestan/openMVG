@@ -101,6 +101,9 @@ struct HashedDescriptions{
   // with k = g * (nb_buckets_per_group + 1) + b, in increasing order.
   std::vector<int> bucket_offsets;
   std::vector<int> bucket_members;
+  // The hash codes of the bucket members, in the same order (nb_hash_words
+  // per entry), so that the codes of a bucket are read sequentially.
+  std::vector<uint64_t> bucket_hash_codes;
 
   const uint64_t * hash_code(int i) const
   {
@@ -118,6 +121,13 @@ struct HashedDescriptions{
     const int * offsets = bucket_offsets.data() + group * (nb_buckets_per_group + 1);
     return {bucket_members.data() + offsets[bucket],
             bucket_members.data() + offsets[bucket + 1]};
+  }
+
+  // Hash code of the bucket member at `member` (a pointer into bucket_members).
+  const uint64_t * bucket_hash_code(const int * member) const
+  {
+    return bucket_hash_codes.data() +
+      static_cast<size_t>(member - bucket_members.data()) * nb_hash_words;
   }
 };
 
@@ -288,6 +298,13 @@ public:
           offsets[b] = offsets[b - 1];
         offsets[0] = g * nbDescriptions;
       }
+
+      const int nb_words = hashed_descriptions.nb_hash_words;
+      hashed_descriptions.bucket_hash_codes.resize(
+        hashed_descriptions.bucket_members.size() * nb_words);
+      for (size_t k = 0; k < hashed_descriptions.bucket_members.size(); ++k)
+        std::copy_n(hashed_descriptions.hash_code(hashed_descriptions.bucket_members[k]),
+          nb_words, hashed_descriptions.bucket_hash_codes.data() + k * nb_words);
     }
     return hashed_descriptions;
   }
@@ -306,12 +323,41 @@ public:
     const int NN = 2
   ) const
   {
+    // Hash codes of 128 bits (the default) get a specialized loop.
+    if (hashed_descriptions1.nb_hash_words == 2)
+      Match_HashedDescriptions<2>(hashed_descriptions1, descriptions1,
+        hashed_descriptions2, descriptions2, pvec_indices, pvec_distances, NN);
+    else
+      Match_HashedDescriptions<0>(hashed_descriptions1, descriptions1,
+        hashed_descriptions2, descriptions2, pvec_indices, pvec_distances, NN);
+  }
+
+  private:
+  // kHashWords: number of 64-bit words of the hash codes, or 0 if given at
+  // run time by the hashed descriptions.
+  template <int kHashWords, typename MatrixT, typename DistanceType>
+  void Match_HashedDescriptions
+  (
+    const HashedDescriptions& hashed_descriptions1,
+    const MatrixT & descriptions1,
+    const HashedDescriptions& hashed_descriptions2,
+    const MatrixT & descriptions2,
+    IndMatches * pvec_indices,
+    std::vector<DistanceType> * pvec_distances,
+    const int NN
+  ) const
+  {
     using MetricT = L2<typename MatrixT::Scalar>;
     MetricT metric;
 
     static const int kNumTopCandidates = 10;
 
-    const int nb_hash_words = hashed_descriptions1.nb_hash_words;
+    const int nb_hash_words =
+      kHashWords > 0 ? kHashWords : hashed_descriptions1.nb_hash_words;
+    // Local copies: the loop below stores to int arrays, which could alias
+    // the members and force reloads.
+    const int nb_hash_code = nb_hash_code_;
+    const int nb_bucket_groups = nb_bucket_groups_;
 
     // Distinct candidates of the current query, in order of first appearance:
     // descriptor ids and hamming distances.
@@ -319,7 +365,7 @@ public:
     std::vector<int> candidate_hamming_distances;
 
     // Number of the current query's candidates with each hamming distance.
-    std::vector<int> num_descriptors_with_hamming_distance(nb_hash_code_ + 1, 0);
+    std::vector<int> num_descriptors_with_hamming_distance(nb_hash_code + 1, 0);
 
     // last_query[id] == i means that descriptor id of the database is already
     // a candidate of query i (prevents duplicates).
@@ -342,18 +388,21 @@ public:
       // bucket id as the query descriptor, and compute the hamming distance of
       // each distinct one based on the hash code.
       size_t nb_candidates = 0;
-      for (int j = 0; j < nb_bucket_groups_; ++j)
+      for (int j = 0; j < nb_bucket_groups; ++j)
       {
         const auto bucket = hashed_descriptions2.bucket(j, bucket_ids[j]);
         nb_candidates += bucket.second - bucket.first;
-        for (const int * it = bucket.first; it != bucket.second; ++it)
+        const uint64_t * candidate_hash_code =
+          hashed_descriptions2.bucket_hash_code(bucket.first);
+        for (const int * it = bucket.first; it != bucket.second;
+          ++it, candidate_hash_code += nb_hash_words)
         {
           const int candidate_id = *it;
           if (last_query[candidate_id] == i)
             continue;
           last_query[candidate_id] = i;
           const int hamming_distance = HammingDistance(
-            hash_code, hashed_descriptions2.hash_code(candidate_id), nb_hash_words);
+            hash_code, candidate_hash_code, nb_hash_words);
           ++num_descriptors_with_hamming_distance[hamming_distance];
           candidate_ids.push_back(candidate_id);
           candidate_hamming_distances.push_back(hamming_distance);
@@ -364,7 +413,7 @@ public:
       // candidates closer than it, and the first num_at_threshold found at it.
       int threshold = 0;
       int num_at_threshold = kNumTopCandidates;
-      while (threshold < nb_hash_code_ &&
+      while (threshold < nb_hash_code &&
         num_descriptors_with_hamming_distance[threshold] < num_at_threshold)
       {
         num_at_threshold -= num_descriptors_with_hamming_distance[threshold];
@@ -414,7 +463,6 @@ public:
     }
   }
 
-  private:
   static int HammingDistance
   (
     const uint64_t * a,

@@ -175,7 +175,7 @@ void Match
       pvec_indices.reserve(regionsJ->RegionCount() * 2);
 
       // Match the query descriptors to the database
-      cascade_hasher.Match_HashedDescriptions<BaseMat, ResultType>(
+      cascade_hasher.Match_HashedDescriptions<Eigen::Map<BaseMat>, ResultType>(
         hashed_base_[J], mat_J,
         hashed_base_[I], mat_I,
         &pvec_indices, &pvec_distances);
@@ -208,7 +208,7 @@ void Match
         std::vector<ResultType> reverse_distances;
         reverse_distances.reserve(regionsI->RegionCount() * 2);
         reverse_indices.reserve(regionsI->RegionCount() * 2);
-        cascade_hasher.Match_HashedDescriptions<BaseMat, ResultType>(
+        cascade_hasher.Match_HashedDescriptions<Eigen::Map<BaseMat>, ResultType>(
           hashed_base_[I], mat_I,
           hashed_base_[J], mat_J,
           &reverse_indices, &reverse_distances);

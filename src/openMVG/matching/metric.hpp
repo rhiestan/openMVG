@@ -67,6 +67,12 @@ struct L2<uint8_t>
       return L2_AVX2(a, b, size);
     }
     #endif
+    #ifdef OPENMVG_HAS_SSE2
+    if (size % 16 == 0)
+    {
+      return L2_SSE2(&*a, &*b, size);
+    }
+    #endif
 
     ResultType result = ResultType();
     ResultType diff0, diff1, diff2, diff3;
