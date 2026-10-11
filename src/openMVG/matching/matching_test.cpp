@@ -158,6 +158,43 @@ TEST(Matching, ArrayMatcher_Hnsw_Simple__NN)
   EXPECT_EQ(IndMatch(0,4), vec_nIndice[4]);
 }
 
+TEST(Matching, ArrayMatcher_Hnsw_Uint8_L2)
+{
+  // SIFT like descriptors: HNSW uses the SIMD kernels of L2<uint8_t>.
+  const int nb_database = 200, dimension = 128, NN = 3;
+  std::mt19937 rng(7);
+  std::uniform_int_distribution<int> value(0, 255);
+  std::vector<uint8_t> database(nb_database * dimension);
+  for (auto & v : database) v = static_cast<uint8_t>(value(rng));
+
+  HNSWMatcher<uint8_t, L2<uint8_t>> matcher;
+  EXPECT_TRUE( matcher.Build(database.data(), nb_database, dimension) );
+
+  // The queries are database rows: their nearest neighbour is themselves.
+  const int nb_query = 10;
+  IndMatches vec_nIndice;
+  std::vector<int> vec_distance;
+  EXPECT_TRUE( matcher.SearchNeighbours(database.data(), nb_query, &vec_nIndice, &vec_distance, NN) );
+  EXPECT_EQ( nb_query * NN, vec_nIndice.size());
+  EXPECT_EQ( nb_query * NN, vec_distance.size());
+
+  for (int i = 0; i < nb_query; ++i)
+  {
+    EXPECT_EQ(IndMatch(i, i), vec_nIndice[i * NN]);
+    EXPECT_EQ(0, vec_distance[i * NN]);
+    for (int k = 0; k < NN; ++k)
+    {
+      const IndMatch & match = vec_nIndice[i * NN + k];
+      int expected = 0;
+      for (int d = 0; d < dimension; ++d)
+        expected += Square(int(database[match.i_ * dimension + d]) - int(database[match.j_ * dimension + d]));
+      EXPECT_EQ(expected, vec_distance[i * NN + k]);
+      if (k > 0)
+        EXPECT_TRUE(vec_distance[i * NN + k - 1] <= vec_distance[i * NN + k]);
+    }
+  }
+}
+
 //-- Test LIMIT case (empty arrays)
 
 TEST(Matching, ArrayMatcherBruteForce_Simple_EmptyArrays)

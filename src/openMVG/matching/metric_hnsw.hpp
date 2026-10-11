@@ -9,6 +9,7 @@
 #ifndef OPENMVG_MATCHING_METRIC_HNSW_HPP
 #define OPENMVG_MATCHING_METRIC_HNSW_HPP
 
+#include "openMVG/matching/metric.hpp"
 #include "openMVG/matching/metric_hamming.hpp"
 
 #include "third_party/hnswlib/hnswlib.h"
@@ -78,6 +79,43 @@ public:
   {}
 
   ~L1SpaceInteger() {}
+
+  size_t get_data_size() override
+  {
+    return data_size_;
+  }
+
+  hnswlib::DISTFUNC<int> get_dist_func() override
+  {
+    return fstdistfunc_;
+  }
+
+  void *get_dist_func_param() override
+  {
+    return &dim_;
+  }
+};
+
+// Squared L2 distance of uint8_t vectors with the SIMD kernels of L2<uint8_t>
+// (hnswlib's L2SpaceI is scalar).
+static int L2Kernel(const void * pVect1, const void * pVect2, const void * qty_ptr)
+{
+  constexpr L2<uint8_t> metricL2{};
+  const uint8_t *a = static_cast<const uint8_t *>(pVect1);
+  const uint8_t *b = static_cast<const uint8_t *>(pVect2);
+  return metricL2(a, b, *(static_cast<const size_t*>(qty_ptr)));
+}
+
+class L2SpaceInteger : public hnswlib::SpaceInterface<int>
+{
+  hnswlib::DISTFUNC<int> fstdistfunc_;
+  size_t data_size_;
+  size_t dim_;
+
+public:
+  explicit L2SpaceInteger(size_t dim):
+    fstdistfunc_(L2Kernel), data_size_(dim * sizeof(uint8_t)), dim_(dim)
+  {}
 
   size_t get_data_size() override
   {
