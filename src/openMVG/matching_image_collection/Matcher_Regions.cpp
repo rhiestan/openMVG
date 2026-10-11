@@ -15,6 +15,10 @@
 #include "openMVG/system/progressinterface.hpp"
 #include "openMVG/system/logger.hpp"
 
+#include <map>
+#include <utility>
+#include <vector>
+
 namespace openMVG {
 namespace matching_image_collection {
 
@@ -88,6 +92,115 @@ void MatchGemm
     ++(*my_progress_bar);
   }
 }
+
+// Mutual matching with matchers that match one direction only: a pair (I, J)
+// needs J matched against the matcher of I and I against the matcher of J.
+// Each image gets a single matcher, used for all the pairs it is part of in
+// either direction, instead of a second matcher built for every pair.
+void MatchMutual
+(
+  const sfm::Regions_Provider & regions_provider,
+  const Pair_Set & pairs,
+  float dist_ratio,
+  EMatcherType matcher_type,
+  bool multithreaded_pair_search,
+  PairWiseMatchesContainer & map_PutativeMatches,
+  system::ProgressInterface * my_progress_bar
+)
+{
+  const std::vector<Pair> pair_list(pairs.cbegin(), pairs.cend());
+
+  // The matches of each pair in both directions, as (I, J) indices, kept
+  // until both are known.
+  struct PairMatches
+  {
+    IndMatches forward, reverse;
+    int nb_directions_done = 0;
+    bool failed = false;
+  };
+  std::vector<PairMatches> pair_matches(pair_list.size());
+
+  // The (pair, is reverse direction) tasks of the matcher of each image.
+  std::map<IndexT, std::vector<std::pair<int, bool>>> image_tasks;
+  for (int k = 0; k < static_cast<int>(pair_list.size()); ++k)
+  {
+    image_tasks[pair_list[k].first].emplace_back(k, false);
+    image_tasks[pair_list[k].second].emplace_back(k, true);
+  }
+
+  // Native mutual matching (the same for all matchers of the type): the
+  // forward direction gives the result and the reverse one is skipped.
+  bool native_mutual = false;
+  const auto report_direction = [&](int k, IndMatches matches, bool reverse, bool failed)
+  {
+#ifdef OPENMVG_USE_OPENMP
+  #pragma omp critical
+#endif
+    {
+      PairMatches & pair = pair_matches[k];
+      (reverse ? pair.reverse : pair.forward) = std::move(matches);
+      pair.failed = pair.failed || failed;
+      if (++pair.nb_directions_done == (native_mutual ? 1 : 2))
+      {
+        IndMatches vec_putative_matches;
+        if (!pair.failed)
+          vec_putative_matches = native_mutual ? std::move(pair.forward) :
+            MutualMatches(std::move(pair.forward), std::move(pair.reverse));
+        if (!vec_putative_matches.empty())
+          map_PutativeMatches.insert( { pair_list[k], std::move(vec_putative_matches) } );
+        pair = PairMatches();
+        ++(*my_progress_bar);
+      }
+    }
+  };
+
+  for (const auto & image_it : image_tasks)
+  {
+    if (my_progress_bar->hasBeenCanceled())
+      continue;
+    const std::shared_ptr<features::Regions> regionsX = regions_provider.get(image_it.first);
+    std::unique_ptr<RegionsMatcher> matcher;
+    if (regionsX->RegionCount() != 0)
+      matcher = RegionMatcherFactory(matcher_type, *regionsX.get());
+    if (matcher)
+      native_mutual = matcher->HasNativeMutualMatching();
+    const auto & tasks = image_it.second;
+
+#ifdef OPENMVG_USE_OPENMP
+    #pragma omp parallel for schedule(dynamic) if (multithreaded_pair_search)
+#endif
+    for (int t = 0; t < static_cast<int>(tasks.size()); ++t)
+    {
+      const int k = tasks[t].first;
+      const bool reverse = tasks[t].second;
+      if (reverse && native_mutual)
+        continue;
+      if (!matcher)
+      {
+        report_direction(k, {}, reverse, true);
+        continue;
+      }
+      // The other image of the pair is the query.
+      const IndexT Y = reverse ? pair_list[k].first : pair_list[k].second;
+      const std::shared_ptr<features::Regions> regionsY = regions_provider.get(Y);
+      if (regionsY->RegionCount() == 0
+          || regionsX->Type_id() != regionsY->Type_id())
+      {
+        report_direction(k, {}, reverse, true);
+        continue;
+      }
+      IndMatches matches;
+      if (native_mutual)
+        matcher->MatchDistanceRatioMutual(dist_ratio, *regionsY.get(), matches);
+      else
+        matcher->MatchDistanceRatio(dist_ratio, *regionsY.get(), matches);
+      if (reverse)
+        for (auto & match : matches) // (J, I) -> (I, J)
+          std::swap(match.i_, match.j_);
+      report_direction(k, std::move(matches), reverse, false);
+    }
+  }
+}
 } // namespace
 
 void Matcher_Regions::Match(
@@ -110,6 +223,18 @@ void Matcher_Regions::Match(
   {
     MatchGemm(*regions_provider, pairs, f_dist_ratio_, b_mutual_,
               map_PutativeMatches, my_progress_bar);
+    return;
+  }
+
+  if (b_mutual_)
+  {
+#ifdef OPENMVG_USE_OPENMP
+    MatchMutual(*regions_provider, pairs, f_dist_ratio_, eMatcherType_,
+                b_multithreaded_pair_search, map_PutativeMatches, my_progress_bar);
+#else
+    MatchMutual(*regions_provider, pairs, f_dist_ratio_, eMatcherType_,
+                false, map_PutativeMatches, my_progress_bar);
+#endif
     return;
   }
 
@@ -158,27 +283,7 @@ void Matcher_Regions::Match(
       }
 
       IndMatches vec_putative_matches;
-      if (b_mutual_ && matcher->HasNativeMutualMatching())
-      {
-        matcher->MatchDistanceRatioMutual(f_dist_ratio_, *regionsJ.get(), vec_putative_matches);
-      }
-      else
-      {
-        matcher->MatchDistanceRatio(f_dist_ratio_, *regionsJ.get(), vec_putative_matches);
-        if (b_mutual_ && !vec_putative_matches.empty())
-        {
-          // Match I against J too, and keep the matches found both ways.
-          IndMatches reverse_matches;
-          const std::unique_ptr<RegionsMatcher> reverse_matcher =
-            RegionMatcherFactory(eMatcherType_, *regionsJ.get());
-          if (reverse_matcher)
-            reverse_matcher->MatchDistanceRatio(f_dist_ratio_, *regionsI.get(), reverse_matches);
-          for (auto & match : reverse_matches) // (J, I) -> (I, J)
-            std::swap(match.i_, match.j_);
-          vec_putative_matches = MutualMatches(std::move(vec_putative_matches),
-                                               std::move(reverse_matches));
-        }
-      }
+      matcher->MatchDistanceRatio(f_dist_ratio_, *regionsJ.get(), vec_putative_matches);
 
 #ifdef OPENMVG_USE_OPENMP
   #pragma omp critical
