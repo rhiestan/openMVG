@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -47,11 +48,17 @@ constexpr int kNBP = 4;
 constexpr int kNBO = 8;
 constexpr int kOrientationBins = 36;
 
-// Rows of DoG kept around a detection row. Refinement moves a keypoint by at
-// most four pixels and then reads one more row on each side.
+// Rows and columns of the Gaussian levels kept around a detection row.
+// Refinement moves a keypoint by at most four pixels and then reads one more
+// row on each side.
 constexpr int kRefineMargin = 7;
 
 int RoundUp(int x, int m) { return (x + m - 1) / m * m; }
+
+// Detection rows per step of a tile. The Gaussian levels are computed in
+// groups of as many rows (BlurRowQuad), so that the blur loads each input row
+// once per group.
+constexpr int kRowsPerStep = 4;
 
 // Rows padded to a multiple of 16 floats. Strides that are a multiple of 4 KiB
 // are bumped so the rows of a vertical filter do not alias in the L1 cache.
@@ -203,7 +210,11 @@ struct OctaveJob {
   int dog_capacity = 0;
 
   // Source of level 0: the rows of `source`, or `source` upsampled by two.
+  // When `source_u8` is set, the source is that 8-bit image instead (only
+  // when upsampling; `source` then gives its size), converted row by row.
   Plane source;
+  const std::uint8_t* source_u8 = nullptr;
+  std::ptrdiff_t source_u8_stride = 0;  // bytes
   bool upsample_source = false;
   int source_margin = 0;
   int source_capacity = 0;
@@ -396,10 +407,12 @@ struct Sift::Impl {
     int max_radius = 1;
     for (int r : job.radius) max_radius = std::max(max_radius, r);
     const std::size_t blur_floats = RoundUp(static_cast<int>(detail::BlurRowScratchSize(ring_width, max_radius)), kPlaneAlign);
-    float* blur_scratch = ThreadScratch(kSlotRow, blur_floats + 4 * static_cast<std::size_t>(ring_width));
+    float* blur_scratch = ThreadScratch(kSlotRow, blur_floats + 6 * static_cast<std::size_t>(ring_width));
     float* up_a = blur_scratch + blur_floats;  // two upsampled rows, indexed by column
     float* up_b = up_a + 2 * ring_width;
-    std::vector<const float*> rows(2 * static_cast<std::size_t>(max_radius) + 2);
+    float* in_a = up_b + 2 * ring_width;  // two converted input rows, indexed by input column
+    float* in_b = in_a + ring_width;
+    std::vector<const float*> rows(2 * static_cast<std::size_t>(max_radius) + 4);
 
     // Rows [start, end) of each level are computed; done = last row computed.
     std::vector<int> done(levels), end(levels);
@@ -420,15 +433,23 @@ struct Sift::Impl {
       y_last = std::min(y_last, src_end - 1);
       const int hin = job.source.height, win = job.source.width;
       const int ix0 = src_x0 / 2, ix1 = std::min(win, (src_x1 + 1) / 2);
+      // Input row iy (the columns that UpsampleRow reads).
+      auto input_row = [&](int iy, float* buf) -> const float* {
+        if (job.source_u8 == nullptr) return job.source.row(iy);
+        float* row = buf - col_base / 2;
+        const int c1 = std::min(win, ix1 + 1);
+        detail::ConvertRowU8(job.source_u8 + iy * job.source_u8_stride + ix0, c1 - ix0, row + ix0);
+        return row;
+      };
       while (src_done < y_last) {
         const int y = ++src_done;
         if (y % 2 == 0) {
-          detail::UpsampleRow(job.source.row(y / 2), win, ix0, ix1, src.row(y));
+          detail::UpsampleRow(input_row(y / 2, in_a), win, ix0, ix1, src.row(y));
         } else {
           float* a = up_a - col_base;
           float* b = up_b - col_base;
-          detail::UpsampleRow(job.source.row(y / 2), win, ix0, ix1, a);
-          detail::UpsampleRow(job.source.row(std::min(y / 2 + 1, hin - 1)), win, ix0, ix1, b);
+          detail::UpsampleRow(input_row(y / 2, in_a), win, ix0, ix1, a);
+          detail::UpsampleRow(input_row(std::min(y / 2 + 1, hin - 1), in_b), win, ix0, ix1, b);
           const int xa = 2 * ix0 / kPlaneAlign * kPlaneAlign;  // aligned; extra columns are unused
           detail::AverageRows(a + xa, b + xa, 2 * ix1 - xa, src.row(y) + xa);
         }
@@ -443,9 +464,9 @@ struct Sift::Impl {
       const int cx0 = col_lo(job.margin[i]), cx1 = col_hi(job.margin[i]);
       while (done[i] < y_last) {
         const int y = done[i] + 1;
-        // Two rows at once when both are needed: the blur loads each input
-        // row once for both.
-        const int n = (r > 0 && y + 1 <= y_last) ? 2 : 1;
+        // Up to four rows at once when they are all needed: the blur loads
+        // each input row once for all of them.
+        const int n = r == 0 ? 1 : (y + 3 <= y_last) ? 4 : (y + 1 <= y_last) ? 2 : 1;
         const int need = std::min(h - 1, y + n - 1 + r);
         if (i == 0) {
           ensure_source(need);
@@ -460,7 +481,10 @@ struct Sift::Impl {
             const int yy = std::clamp(y + j, 0, h - 1);
             rows[j + r] = i == 0 ? source_row(yy) : g[i - 1].row(yy);
           }
-          if (n == 2) {
+          if (n == 4) {
+            detail::BlurRowQuad(rows.data(), r, job.kernel[i].data(), w, cx0, cx1, out_row, g[i].row(y + 1),
+                                g[i].row(y + 2), g[i].row(y + 3), blur_scratch);
+          } else if (n == 2) {
             detail::BlurRowPair(rows.data(), r, job.kernel[i].data(), w, cx0, cx1, out_row, g[i].row(y + 1),
                                 blur_scratch);
           } else {
@@ -480,9 +504,11 @@ struct Sift::Impl {
     };
 
     // DoG level j is Gaussian level j + 1 minus level j, on the tile plus R
-    // columns (aligned down so that the vector loads are aligned).
+    // columns (aligned down so that the vector loads are aligned). Only the
+    // rows around the detection rows are kept; refinement reads the Gaussian
+    // levels instead.
     const int dog_x0 = col_lo(R) / kPlaneAlign * kPlaneAlign, dog_x1 = col_hi(R);
-    int dog_done = std::max(0, y0 - R) - 1;
+    int dog_done = std::max(0, y0 - 1) - 1;
     auto ensure_dog = [&](int y_last) {
       y_last = std::min(y_last, h - 1);
       while (dog_done < y_last) {
@@ -501,13 +527,11 @@ struct Sift::Impl {
     const int det_x0 = std::max(x0, 1), det_x1 = std::min(x1, w - 1);
     const int next_x0 = x0 / 2, next_x1 = job.has_next ? std::min(x1 / 2, job.next_base.width) : 0;
 
-    // Two detection rows per step, so that the levels are computed in pairs
-    // of rows.
-    for (int y_step = y0; y_step < y1; y_step += 2) {
-      const int y_ahead = std::min(h - 1, y_step + 1 + R);
+    for (int y_step = y0; y_step < y1; y_step += kRowsPerStep) {
+      const int y_ahead = std::min(h - 1, y_step + kRowsPerStep - 1 + R);
       ensure(ensure, levels - 1, y_ahead);
-      ensure_dog(y_ahead);
-      for (int y = y_step; y < std::min(y1, y_step + 2); ++y) {
+      ensure_dog(y_step + kRowsPerStep);
+      for (int y = y_step; y < std::min(y1, y_step + kRowsPerStep); ++y) {
 
       // The next octave starts from level s = S - 1 (index S) downsampled.
       if (job.has_next && y % 2 == 0 && y / 2 < job.next_base.height && next_x1 > next_x0) {
@@ -527,7 +551,10 @@ struct Sift::Impl {
           detail::FindExtremaRow(prev_rows, cur_rows, next_rows, det_x0, det_x1, job.threshold, xs);
           for (const int x : xs) {
             Detection det;
-            auto at = [&](int xx, int yy, int ss) -> double { return dog[ss + 1].row(yy)[xx]; };
+            // The same float difference as the DoG rows.
+            auto at = [&](int xx, int yy, int ss) -> double {
+              return g[ss + 2].row(yy)[xx] - g[ss + 1].row(yy)[xx];
+            };
             if (Refine(at, w, h, s, x, y, xper, sigma0, det)) {
               det.cx = x;
               det.cy = y;
@@ -710,13 +737,15 @@ struct Sift::Impl {
     }
     for (int i = 0; i < levels; ++i) {
       const int consumer = i + 1 < levels ? 2 * job.radius[i + 1] + 1 : 0;
-      job.capacity[i] = std::max(job.margin[i] + kRefineMargin, consumer) + 4;  // slack for pairs of rows
+      // Rows from R above the detection rows of a step to the last row
+      // computed for them.
+      job.capacity[i] = std::max(job.margin[i] + kRefineMargin, consumer) + kRowsPerStep + 2;
     }
-    job.dog_capacity = 2 * kRefineMargin + 4;
+    job.dog_capacity = kRowsPerStep + 2;  // the detection rows of a step and one more on each side
     job.source = source;
     job.upsample_source = upsample;
     job.source_margin = job.margin[0] + job.radius[0];
-    job.source_capacity = 2 * job.radius[0] + 3;
+    job.source_capacity = 2 * job.radius[0] + kRowsPerStep + 1;
     job.threshold = static_cast<float>(0.8 * params.peak_threshold);
     for (const PlaneBuffer& b : kept) job.kept.push_back(b.plane(w, h));
     job.has_next = ss.exists(o + 1);
@@ -726,15 +755,22 @@ struct Sift::Impl {
       job.next_base = base_buffers[next_base].plane(ss.width(o + 1), ss.height(o + 1));
     }
 
-    // Tiles: about kTileWidth columns wide, so that the rings of a tile stay
-    // small, and about two per thread, while at least twice the margin in
-    // each direction so that the recomputed rows and columns stay a small
-    // fraction. Tile columns start at multiples of 32 so that the next
-    // octave's columns start aligned.
-    constexpr int kTileWidth = 1024;
+    // Tiles: narrow enough that the rings of a tile fit a budget of about
+    // the size of a core's L2 cache, and about two per thread, while at
+    // least twice the margin in each direction so that the recomputed rows
+    // and columns stay a small fraction. With several threads, wider tiles
+    // are much slower: the rings then spill to the shared L3 cache, which
+    // all cores compete for. Tile columns start at multiples of 32 so that
+    // the next octave's columns start aligned.
+    constexpr std::size_t kRingBudget = 640 * 1024;
+    std::size_t ring_rows = static_cast<std::size_t>(levels - 1) * job.dog_capacity + (upsample ? job.source_capacity : 0);
+    for (int c : job.capacity) ring_rows += c;
+    const int widest = std::max(job.source_margin, job.margin[0]);
+    const int ring_columns = static_cast<int>(kRingBudget / (sizeof(float) * ring_rows));
     const int threads = static_cast<int>(std::max(1u, exec->concurrency()));
     const int min_size = std::max(32, 2 * job.margin[0]);
-    const int planned = std::max(1, std::min((w + kTileWidth / 2) / kTileWidth, w / min_size));
+    const int tile_w = std::max(min_size, ring_columns - 2 * widest - 4 * kPlaneAlign);
+    const int planned = std::max(1, std::min((w + tile_w / 2) / tile_w, w / min_size));
     const int strip_w = RoundUp((w + planned - 1) / planned, 32);
     oc.strips = (w + strip_w - 1) / strip_w;
     const int wanted_bands = (2 * threads + oc.strips - 1) / oc.strips;
@@ -749,35 +785,56 @@ struct Sift::Impl {
 
   void RunTile(OctaveScale& oc, std::size_t t, double sigma0) const {
     ProcessTile(oc.job, oc.tiles[t], oc.xper, sigma0, &oc.tile_detections[t * oc.job.S]);
+    detail::FlushStream();  // the kept levels are read by other threads
   }
 
   // VLFeat lists the keypoints of an octave by level, then by the row and
   // column where the extremum was found. Tiles are band-major and each lists
   // a level in row-major order, so per level and band it is enough to merge
-  // the band's tiles by row; a stable sort keeps the column order.
-  OctaveKeys CollectKeys(const OctaveScale& oc) const {
+  // the band's tiles by row, in tile order. The groups (level, band) are
+  // merged in parallel, each with a counting sort by row.
+  OctaveKeys CollectKeys(const OctaveScale& oc) {
     const int S = oc.job.S;
     OctaveKeys k;
     k.xper = oc.xper;
     k.o = oc.o;
     k.kept = oc.job.kept;
-    std::size_t total = 0;
-    for (const auto& v : oc.tile_detections) total += v.size();
-    k.keys.reserve(total);
-    const std::size_t bands = oc.tiles.size() / oc.strips;
-    for (int s = 0; s < S; ++s) {
-      for (std::size_t b = 0; b < bands; ++b) {
-        const std::size_t start = k.keys.size();
-        for (int x = 0; x < oc.strips; ++x) {
-          const auto& v = oc.tile_detections[(b * oc.strips + x) * S + s];
-          k.keys.insert(k.keys.end(), v.begin(), v.end());
+    const std::size_t strips = static_cast<std::size_t>(oc.strips);
+    const std::size_t bands = oc.tiles.size() / strips;
+    const std::size_t groups = static_cast<std::size_t>(S) * bands;  // level-major
+    std::vector<std::size_t> offset(groups + 1, 0);
+    for (std::size_t g = 0; g < groups; ++g) {
+      const std::size_t s = g / bands, b = g % bands;
+      std::size_t n = 0;
+      for (std::size_t x = 0; x < strips; ++x) n += oc.tile_detections[(b * strips + x) * S + s].size();
+      offset[g + 1] = offset[g] + n;
+    }
+    k.keys.resize(offset[groups]);
+    exec->parallel_for(groups, 1, [&](std::size_t g0, std::size_t g1) {
+      std::vector<std::size_t> row_start;
+      for (std::size_t g = g0; g < g1; ++g) {
+        const std::size_t s = g / bands, b = g % bands;
+        const Tile& band = oc.tiles[b * strips];
+        Detection* dst = k.keys.data() + offset[g];
+        if (strips == 1) {
+          const auto& v = oc.tile_detections[b * S + s];
+          std::copy(v.begin(), v.end(), dst);
+          continue;
         }
-        if (oc.strips > 1) {
-          std::stable_sort(k.keys.begin() + start, k.keys.end(),
-                           [](const Detection& a, const Detection& c) { return a.cy < c.cy; });
+        row_start.assign(static_cast<std::size_t>(band.y1 - band.y0) + 1, 0);
+        for (std::size_t x = 0; x < strips; ++x) {
+          for (const Detection& d : oc.tile_detections[(b * strips + x) * S + s]) {
+            ++row_start[static_cast<std::size_t>(d.cy - band.y0) + 1];
+          }
+        }
+        for (std::size_t y = 1; y < row_start.size(); ++y) row_start[y] += row_start[y - 1];
+        for (std::size_t x = 0; x < strips; ++x) {
+          for (const Detection& d : oc.tile_detections[(b * strips + x) * S + s]) {
+            dst[row_start[static_cast<std::size_t>(d.cy - band.y0)]++] = d;
+          }
         }
       }
-    }
+    });
     k.chunks.resize((k.keys.size() + kKeyChunk - 1) / kKeyChunk);
     return k;
   }
@@ -811,10 +868,13 @@ struct Sift::Impl {
     }
   }
 
+  // `out` is only resized at the end, so that a reused Features keeps its
+  // memory: clearing it first would make resize() fill all of it with zeros
+  // again (tens of megabytes for large images).
   void Extract(const ImageView& image, Features& out) {
-    out.keypoints.clear();
-    out.descriptors.clear();
     if (image.data == nullptr || image.width <= 0 || image.height <= 0) {
+      out.keypoints.clear();
+      out.descriptors.clear();
       throw std::invalid_argument("lsift: empty image");
     }
 
@@ -832,7 +892,11 @@ struct Sift::Impl {
     ss.sigma0 = params.base_sigma * ss.sigmak;
     ss.sigman = params.nominal_sigma;
     const double dsigma0 = ss.sigma0 * std::sqrt(1.0 - 1.0 / (ss.sigmak * ss.sigmak));
-    if (!ss.exists(o_min)) return;
+    if (!ss.exists(o_min)) {
+      out.keypoints.clear();
+      out.descriptors.clear();
+      return;
+    }
     const int W = ss.W, H = ss.H;
     const int w0 = ss.width(o_min), h0 = ss.height(o_min);
 
@@ -840,7 +904,16 @@ struct Sift::Impl {
     // that one octave's keypoints can be processed while the next octave's
     // scale space is computed.
     const bool keep_levels = !params.upright || params.compute_descriptors;
-    input_buffer.reserve(PlaneFloats(W, H));
+    // A float image is read in place when it is only resampled (by the
+    // kernels that stay within the row width); otherwise it is copied to a
+    // padded, aligned plane.
+    const bool read_in_place = image.type == PixelType::F32 && o_min != 0 &&
+                               image.stride % static_cast<std::ptrdiff_t>(sizeof(float)) == 0 &&
+                               reinterpret_cast<std::uintptr_t>(image.data) % alignof(float) == 0;
+    // An 8-bit image that the first octave upsamples is converted row by row
+    // while streaming.
+    const bool convert_streaming = image.type == PixelType::U8 && o_min == -1;
+    if (!read_in_place && !convert_streaming) input_buffer.reserve(PlaneFloats(W, H));
     const std::size_t base_floats = std::max(PlaneFloats(ss.width(o_min + 1), ss.height(o_min + 1)),
                                              o_min > 0 ? PlaneFloats(w0, h0) : std::size_t{0});
     for (auto& b : base_buffers) b.reserve(base_floats);
@@ -864,8 +937,16 @@ struct Sift::Impl {
     }
 
     LSIFT_PROFILER();
-    const Plane input = input_buffer.plane(W, H);
-    ForRows(H, RowGrain(W, 1 << 16), [&](int y0, int y1) { detail::ConvertRows(image, input, y0, y1); });
+    Plane input;
+    if (convert_streaming) {
+      input = Plane{nullptr, W, H, 0};
+    } else if (read_in_place) {
+      const std::ptrdiff_t stride = image.stride != 0 ? image.stride / static_cast<std::ptrdiff_t>(sizeof(float)) : W;
+      input = Plane{const_cast<float*>(static_cast<const float*>(image.data)), W, H, stride};  // never written
+    } else {
+      input = input_buffer.plane(W, H);
+      ForRows(H, RowGrain(W, 1 << 16), [&](int y0, int y1) { detail::ConvertRows(image, input, y0, y1); });
+    }
 
     Plane source = input;  // level 0 of the first octave comes from here
     bool upsample = false;
@@ -894,6 +975,10 @@ struct Sift::Impl {
     // in the job because they are the larger items.
     int next_base = 0;
     OctaveScale cur = SetupOctave(ss, o_min, source, upsample, level_buffers[0], next_base);
+    if (convert_streaming) {
+      cur.job.source_u8 = static_cast<const std::uint8_t*>(image.data);
+      cur.job.source_u8_stride = image.stride != 0 ? image.stride : W;
+    }
     exec->parallel_for(cur.tiles.size(), 1, [&](std::size_t b, std::size_t e) {
       for (std::size_t t = b; t < e; ++t) RunTile(cur, t, ss.sigma0);
     });
@@ -937,14 +1022,16 @@ struct Sift::Impl {
       }
     }
     out.keypoints.resize(total);
-    if (params.compute_descriptors) out.descriptors.resize(total * kDescriptorSize);
+    out.descriptors.resize(params.compute_descriptors ? total * kDescriptorSize : 0);
     exec->parallel_for(chunks.size(), 64, [&](std::size_t b, std::size_t e) {
       for (std::size_t i = b; i < e; ++i) {
         const KeyChunk& c = *chunks[i].first;
         std::copy(c.keypoints.begin(), c.keypoints.end(), out.keypoints.begin() + chunks[i].second);
-        std::copy(c.descriptors.begin(), c.descriptors.end(),
-                  out.descriptors.begin() + chunks[i].second * kDescriptorSize);
+        // The descriptors are not read again here: write them around the cache.
+        detail::StreamCopy(c.descriptors.data(), c.descriptors.size(),
+                           out.descriptors.data() + chunks[i].second * kDescriptorSize);
       }
+      detail::FlushStream();
     });
     LSIFT_MARK("output");
   }

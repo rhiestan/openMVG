@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "hwy/cache_control.h"
 #include "hwy/highway.h"
 #include "kernels.h"
 
@@ -84,6 +85,22 @@ void ConvertRowsImpl(const ImageView& src, const Plane& dst, int y0, int y1) {
     }
     for (; x < w; ++x) out[x] = in[x] / 255.0f;
   }
+}
+
+// out[x] = in[x] / 255 for x < n; `out` need not be aligned. The same
+// arithmetic as ConvertRowsImpl.
+void ConvertRowU8Impl(const std::uint8_t* in, int n, float* out) {
+  const DF d;
+  const int N = static_cast<int>(hn::Lanes(d));
+  const hn::Rebind<std::uint8_t, DF> d8;
+  const DI di;
+  const VF scale = hn::Set(d, 255.0f);
+  int x = 0;
+  for (; x + N <= n; x += N) {
+    const VF v = hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(d8, in + x)));
+    hn::StoreU(hn::Div(v, scale), d, out + x);
+  }
+  for (; x < n; ++x) out[x] = in[x] / 255.0f;
 }
 
 // For x in [xb, xe): out[2x] = in[x], out[2x+1] = (in[x] + in[x+1]) / 2,
@@ -176,6 +193,16 @@ void StreamRowImpl(const float* HWY_RESTRICT src, int n, float* HWY_RESTRICT dst
   int x = 0;
   for (; x + N <= n; x += N) hn::Stream(hn::LoadU(d, src + x), d, dst + x);
   for (; x < n; ++x) dst[x] = src[x];
+}
+
+// Copies n floats with non-temporal stores; `dst` need not be aligned.
+void StreamCopyImpl(const float* HWY_RESTRICT src, std::size_t n, float* HWY_RESTRICT dst) {
+  const DF d;
+  const std::size_t N = hn::Lanes(d);
+  std::size_t i = 0;
+  for (; i < n && reinterpret_cast<std::uintptr_t>(dst + i) % (N * sizeof(float)) != 0; ++i) dst[i] = src[i];
+  for (; i + N <= n; i += N) hn::Stream(hn::LoadU(d, src + i), d, dst + i);
+  for (; i < n; ++i) dst[i] = src[i];
 }
 
 void DownsampleRowImpl(const float* in, int w_out, float* out) {
@@ -356,6 +383,60 @@ void BlurRowPairImpl(const float* const* rows, int radius, const float* kernel, 
   }
   HorizontalPass(d, kernel, r, w, x0, x1, tmp0, out0);
   HorizontalPass(d, kernel, r, w, x0, x1, tmp1, out1);
+}
+
+// Four consecutive output rows y .. y + 3; rows[0..2r+3] are the input rows
+// y - r .. y + 3 + r. Each input row is loaded once for all four outputs, which
+// nearly halves the traffic from L2 that limits the vertical pass, compared
+// with BlurRowPair. The sums are the same as in BlurRow, in the same order, so
+// that results do not depend on how rows are grouped.
+void BlurRowQuadImpl(const float* const* rows, int radius, const float* kernel, int w, int x0, int x1, float* out0,
+                     float* out1, float* out2, float* out3, float* scratch) {
+  const DF d;
+  const int N = static_cast<int>(hn::Lanes(d));
+  const int r = radius;
+  int xa;
+  float* tmp0 = BlurTmp(scratch, r, x0, xa);
+  const std::size_t tmp_floats = BlurTmpFloats(x1 - x0, r);
+  float* tmp1 = tmp0 + tmp_floats;
+  float* tmp2 = tmp1 + tmp_floats;
+  float* tmp3 = tmp2 + tmp_floats;
+  const int xe = std::min(w, x1 + r + N);
+  const VF k0 = hn::Set(d, kernel[0]);
+  const float* const* in = rows + r;  // in[t] is input row y + t
+
+  for (int x = xa; x < xe; x += N) {
+    const VF c0 = hn::Load(d, in[0] + x), c1 = hn::Load(d, in[1] + x);
+    const VF c2 = hn::Load(d, in[2] + x), c3 = hn::Load(d, in[3] + x);
+    VF o0 = hn::Mul(k0, c0), o1 = hn::Mul(k0, c1), o2 = hn::Mul(k0, c2), o3 = hn::Mul(k0, c3);
+    // For tap j, output t adds in[t - j] + in[t + j]: lt = in[t - j], rt = in[t + j].
+    VF l0 = hn::Load(d, in[-1] + x), l1 = c0, l2 = c1, l3 = c2;
+    VF r0 = c1, r1 = c2, r2 = c3, r3 = hn::Load(d, in[4] + x);
+    for (int j = 1;; ++j) {
+      const VF k = hn::Set(d, kernel[j]);
+      o0 = hn::MulAdd(k, hn::Add(l0, r0), o0);
+      o1 = hn::MulAdd(k, hn::Add(l1, r1), o1);
+      o2 = hn::MulAdd(k, hn::Add(l2, r2), o2);
+      o3 = hn::MulAdd(k, hn::Add(l3, r3), o3);
+      if (j == r) break;
+      l3 = l2;
+      l2 = l1;
+      l1 = l0;
+      l0 = hn::Load(d, in[-j - 1] + x);
+      r0 = r1;
+      r1 = r2;
+      r2 = r3;
+      r3 = hn::Load(d, in[j + 4] + x);
+    }
+    hn::Store(o0, d, tmp0 + x);
+    hn::Store(o1, d, tmp1 + x);
+    hn::Store(o2, d, tmp2 + x);
+    hn::Store(o3, d, tmp3 + x);
+  }
+  HorizontalPass(d, kernel, r, w, x0, x1, tmp0, out0);
+  HorizontalPass(d, kernel, r, w, x0, x1, tmp1, out1);
+  HorizontalPass(d, kernel, r, w, x0, x1, tmp2, out2);
+  HorizontalPass(d, kernel, r, w, x0, x1, tmp3, out3);
 }
 
 // ---------------------------------------------------------------------------
@@ -838,6 +919,7 @@ HWY_AFTER_NAMESPACE();
 namespace lsift::detail {
 
 HWY_EXPORT(ConvertRowsImpl);
+HWY_EXPORT(ConvertRowU8Impl);
 HWY_EXPORT(UpsampleRowsImpl);
 HWY_EXPORT(DownsampleRowsImpl);
 HWY_EXPORT(UpsampleRowImpl);
@@ -845,8 +927,10 @@ HWY_EXPORT(AverageRowsImpl);
 HWY_EXPORT(SubtractRowsImpl);
 HWY_EXPORT(DownsampleRowImpl);
 HWY_EXPORT(StreamRowImpl);
+HWY_EXPORT(StreamCopyImpl);
 HWY_EXPORT(BlurRowImpl);
 HWY_EXPORT(BlurRowPairImpl);
+HWY_EXPORT(BlurRowQuadImpl);
 HWY_EXPORT(FindExtremaRowImpl);
 HWY_EXPORT(OrientationHistogramImpl);
 HWY_EXPORT(DescriptorHistogramImpl);
@@ -855,6 +939,8 @@ HWY_EXPORT(TargetNameImpl);
 void ConvertRows(const ImageView& src, const Plane& dst, int y0, int y1) {
   HWY_DYNAMIC_DISPATCH(ConvertRowsImpl)(src, dst, y0, y1);
 }
+
+void ConvertRowU8(const std::uint8_t* in, int n, float* out) { HWY_DYNAMIC_DISPATCH(ConvertRowU8Impl)(in, n, out); }
 
 void UpsampleRows(const Plane& src, const Plane& dst, int y0, int y1, float* scratch) {
   HWY_DYNAMIC_DISPATCH(UpsampleRowsImpl)(src, dst, y0, y1, scratch);
@@ -882,11 +968,15 @@ void DownsampleRow(const float* in, int w_out, float* out) {
 
 void StreamRow(const float* src, int n, float* dst) { HWY_DYNAMIC_DISPATCH(StreamRowImpl)(src, n, dst); }
 
+void StreamCopy(const float* src, std::size_t n, float* dst) { HWY_DYNAMIC_DISPATCH(StreamCopyImpl)(src, n, dst); }
+
+void FlushStream() { hwy::FlushStream(); }
+
 std::size_t BlurRowScratchSize(int columns, int radius) {
-  // Two vertical-pass buffers (BlurRowPair) and the offset of the first.
+  // Four vertical-pass buffers (BlurRowQuad) and the offset of the first.
   const std::size_t tmp = static_cast<std::size_t>(
       (columns + 4 * radius + 8 * kPlaneAlign + 2 * kPlaneGuard + kPlaneAlign - 1) / kPlaneAlign * kPlaneAlign);
-  return 2 * tmp + static_cast<std::size_t>(radius) + 4 * kPlaneAlign + kPlaneGuard;
+  return 4 * tmp + static_cast<std::size_t>(radius) + 4 * kPlaneAlign + kPlaneGuard;
 }
 
 void BlurRow(const float* const* rows, int radius, const float* kernel, int w, int x0, int x1, float* out,
@@ -897,6 +987,11 @@ void BlurRow(const float* const* rows, int radius, const float* kernel, int w, i
 void BlurRowPair(const float* const* rows, int radius, const float* kernel, int w, int x0, int x1, float* out0,
                  float* out1, float* scratch) {
   HWY_DYNAMIC_DISPATCH(BlurRowPairImpl)(rows, radius, kernel, w, x0, x1, out0, out1, scratch);
+}
+
+void BlurRowQuad(const float* const* rows, int radius, const float* kernel, int w, int x0, int x1, float* out0,
+                 float* out1, float* out2, float* out3, float* scratch) {
+  HWY_DYNAMIC_DISPATCH(BlurRowQuadImpl)(rows, radius, kernel, w, x0, x1, out0, out1, out2, out3, scratch);
 }
 
 void FindExtremaRow(const float* const* prev, const float* const* cur, const float* const* next, int xb, int xe,

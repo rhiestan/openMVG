@@ -37,6 +37,9 @@ struct Plane {
 /// Converts rows [y0, y1) of `src` to floats in [0, 1].
 void ConvertRows(const ImageView& src, const Plane& dst, int y0, int y1);
 
+/// out[x] = in[x] / 255 for x < n, as ConvertRows; `out` need not be aligned.
+void ConvertRowU8(const std::uint8_t* in, int n, float* out);
+
 /// Writes rows [2 * y0, 2 * y1) of `dst`, the source upsampled by two with
 /// VLFeat's linear interpolation (rows first, then columns).
 /// `scratch` needs 2 * (dst.stride + kPlaneAlign) floats.
@@ -61,6 +64,14 @@ void SubtractRows(const float* a, const float* b, int n, float* out);
 /// data that is not read again soon.
 void StreamRow(const float* src, int n, float* dst);
 
+/// Copies n floats to `dst` (any alignment) with non-temporal stores.
+void StreamCopy(const float* src, std::size_t n, float* dst);
+
+/// Must be called after StreamRow or StreamCopy and before another thread
+/// reads the data: orders the non-temporal stores of the calling thread
+/// before its later stores.
+void FlushStream();
+
 /// out[x] = in[2x] for x < w_out.
 void DownsampleRow(const float* in, int w_out, float* out);
 
@@ -81,6 +92,12 @@ void BlurRow(const float* const* rows, int radius, const float* kernel, int w, i
 /// radius rows below the second. Each input row is loaded once for both.
 void BlurRowPair(const float* const* rows, int radius, const float* kernel, int w, int x0, int x1, float* out0,
                  float* out1, float* scratch);
+
+/// Four consecutive output rows of BlurRow at once: `rows` holds the
+/// 2 * radius + 4 input rows from radius rows above the first output row to
+/// radius rows below the last.
+void BlurRowQuad(const float* const* rows, int radius, const float* kernel, int w, int x0, int x1, float* out0,
+                 float* out1, float* out2, float* out3, float* scratch);
 
 /// Appends the x in [xb, xe) of the strict local extrema in row `cur[1]`
 /// (against its 26 neighbours in the three rows of `prev`, `cur` and `next`,

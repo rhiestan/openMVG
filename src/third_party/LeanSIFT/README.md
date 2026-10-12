@@ -21,13 +21,14 @@ doubled as in Lowe's paper). VLFeat is single-threaded.
 
 | image | size | features | VLFeat | LeanSift, 1 thread | LeanSift, 16 threads | speed-up |
 |---|---|---|---|---|---|---|
-| box.pgm | 324x223 | 703 | 89 | 10.4 (10.2) | 2.4 (2.2) | 37x |
-| roofs1.jpg | 640x478 | 4601 | 394 | 56.0 (55.0) | 9.0 (7.4) | 44x |
-| graf1.png | 800x640 | 4191 | 393 | 66.3 (65.4) | 8.8 (8.5) | 45x |
-| river1.jpg | 1024x768 | 11511 | 1010 | 149 (147) | 19.7 (18.5) | 51x |
-| 12 MP mosaic | 4000x3000 | 170043 | 14299 | 2222 (2203) | 284 (274) | 50x |
+| box.pgm | 324x223 | 703 | 88 | 10.0 (9.9) | 1.9 (1.7) | 46x |
+| roofs1.jpg | 640x478 | 4601 | 390 | 55.2 (54.8) | 6.6 (6.0) | 59x |
+| graf1.png | 800x640 | 4191 | 389 | 66.7 (65.9) | 8.6 (7.6) | 45x |
+| river1.jpg | 1024x768 | 11511 | 991 | 144 (143) | 16.9 (16.1) | 59x |
+| 12 MP mosaic | 4000x3000 | 170043 | 14084 | 2184 (2150) | 219 (212) | 64x |
 
-With 32 threads (SMT) the 12 MP image takes 282 (271) ms.
+With 32 threads (SMT) the 12 MP image takes 232 (224) ms. The extractor is reused
+between runs (see [Usage](#usage)).
 
 Agreement with VLFeat on the same images: 99.86 to 99.97 % of VLFeat's keypoints
 have a LeanSift keypoint within 0.05 pixels (of their octave), 0.7 % in scale and
@@ -87,6 +88,12 @@ std::vector<std::uint8_t> bytes = f.descriptors_u8();  // as vl_sift: min(512 d,
 
 Images are 8-bit or float grayscale (float in [0, 1]), with an optional row stride.
 
+Reuse `lsift::Sift` (and, if convenient, the `Features`) for many images: it keeps its
+buffers, which are large for large images (about 900 MB for 12 MP with the default
+first octave -1). A new extractor gets fresh memory from the operating system, which
+has to zero it on first use; for a 12 MP image on 16 threads that nearly doubles the
+time.
+
 ### Threads
 
 `lsift::Sift` runs its parallel loops on an `lsift::Executor`. By default this is a
@@ -138,8 +145,8 @@ After `cmake --install`, use the library with `find_package(LeanSift)` and
 
 - `lsift [options] image [out.txt]` extracts features and writes them as text
   (`x y sigma angle` and 128 descriptor bytes per line).
-- `lsift_bench [--threads N] [--repeat N] image...` compares speed and output with
-  VLFeat.
+- `lsift_bench [--threads N] [--repeat N] [--u8] image...` compares speed and output
+  with VLFeat (`--u8` passes 8-bit instead of float images to LeanSift).
 - `lsift_microbench` measures single kernels (development aid).
 - `-DLSIFT_PROFILE=ON` makes the library print the time of each phase.
 
@@ -147,12 +154,12 @@ After `cmake --install`, use the library with `find_package(LeanSift)` and
 
 See [docs/design.md](docs/design.md). In short: VLFeat stores every Gaussian and
 difference-of-Gaussian level of an octave as a full image, which makes it limited by
-memory bandwidth. LeanSift processes each octave in one streaming pass over tiles of
-about 1024 columns: the Gaussian levels live in small ring buffers of rows, and the
-DoG, extremum detection, sub-pixel refinement and the next octave's base image are
-computed while the rows are still in cache. Orientations and descriptors compute
-gradients on the fly from the stored levels. All per-pixel work uses SIMD kernels
-written once with Highway.
+memory bandwidth. LeanSift processes each octave in one streaming pass over tiles
+whose ring buffers fit in about the L2 cache of a core: the Gaussian levels live in
+small ring buffers of rows, and the DoG, extremum detection, sub-pixel refinement and
+the next octave's base image are computed while the rows are still in cache.
+Orientations and descriptors compute gradients on the fly from the stored levels. All
+per-pixel work uses SIMD kernels written once with Highway.
 
 ## Compatibility notes
 

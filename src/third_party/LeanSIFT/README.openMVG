@@ -1,7 +1,7 @@
 Project: LeanSift
 URL: https://github.com/rhiestan/LeanSIFT
 License: BSD-2-Clause
-Upstream commit: 9c621f8f7075dbb3d164c620fa90cf02a26a449d
+Upstream commit: 94ea995f9a1caeceeb0a8b2ab18a59d9114a92e6
 
 Only the library is vendored (CMakeLists.txt, cmake/, include/, src/); the
 tests, tools and their support code are not. Google Highway, its only
