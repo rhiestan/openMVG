@@ -36,6 +36,7 @@
 #include <sstream>
 #include "Eigen/OrderingMethods"
 #include "Eigen/SparseCore"
+#include "HeaderOnlyMetis.h"
 #include "SupernodalLDLT.h"
 #ifdef CERES_USE_OPENMP
 #include "SupernodalLUExecutorOpenMP.h"
@@ -52,6 +53,15 @@ namespace internal {
 // Schur complements) are symmetric positive semi-definite, possibly with a
 // Levenberg-Marquardt diagonal; Bunch-Kaufman pivoting keeps the
 // factorization well defined if they are not quite definite.
+//
+// Ordering: by default (use_postordering false) ceres pre-orders the matrix
+// with AMD on its parameter block graph and asks for a NATURAL ordering here.
+// Nested dissection (DirectLUSolvers' header-only METIS port, deterministic)
+// of the scalar matrix gives the supernodal factorization less or similar
+// fill and independent subtrees to run in parallel: on bundle adjustment
+// reduced camera systems of 1600-10000 cameras it factored 1.1-2.8x faster
+// than the block AMD order with 32 threads. So NATURAL is factored in
+// nested dissection order; an explicit AMD request stays AMD.
 
 #ifdef CERES_USE_OPENMP
 typedef Eigen::supernodal_lu::OpenMPExecutor SupernodalExecutor;
@@ -59,14 +69,28 @@ typedef Eigen::supernodal_lu::OpenMPExecutor SupernodalExecutor;
 typedef Eigen::supernodal_lu::SerialExecutor SupernodalExecutor;
 #endif
 
+// Eigen runs its dense products (the supernode updates) on OpenMP's default
+// number of threads, not on ceres' num_threads. Limit it while the solver
+// runs: with num_threads 1, idle OpenMP workers spinning after a parallel
+// product would otherwise slow down everything that follows.
+class ScopedEigenThreads {
+ public:
+  explicit ScopedEigenThreads(int num_threads) : saved_(Eigen::nbThreads()) {
+    Eigen::setNbThreads(num_threads);
+  }
+  ~ScopedEigenThreads() { Eigen::setNbThreads(saved_); }
+
+ private:
+  const int saved_;
+};
+
 template <typename Solver>
 class EigenSparseCholeskyTemplate : public EigenSparseCholesky {
  public:
-  explicit EigenSparseCholeskyTemplate(int num_threads) : analyzed_(false) {
+  explicit EigenSparseCholeskyTemplate(int num_threads)
+      : analyzed_(false), num_threads_(num_threads > 0 ? num_threads : 1) {
 #ifdef CERES_USE_OPENMP
-    solver_.executor() = SupernodalExecutor(num_threads > 0 ? num_threads : 1);
-#else
-    (void)num_threads;
+    solver_.executor() = SupernodalExecutor(num_threads_);
 #endif
   }
   virtual ~EigenSparseCholeskyTemplate() {}
@@ -76,6 +100,7 @@ class EigenSparseCholeskyTemplate : public EigenSparseCholesky {
 
   virtual LinearSolverTerminationType Factorize(
       const Eigen::SparseMatrix<double>& lhs, std::string* message) {
+    ScopedEigenThreads eigen_threads(num_threads_);
     if (!analyzed_) {
       solver_.analyzePattern(lhs);
 
@@ -107,6 +132,7 @@ class EigenSparseCholeskyTemplate : public EigenSparseCholesky {
                                             double* solution,
                                             std::string* message) {
     CHECK(analyzed_) << "Solve called without a call to Factorize first.";
+    ScopedEigenThreads eigen_threads(num_threads_);
 
     // rhs and solution may alias; the solver reads b after it starts
     // writing x (iterative refinement), so take a copy of the rhs.
@@ -136,6 +162,7 @@ class EigenSparseCholeskyTemplate : public EigenSparseCholesky {
 
  private:
   bool analyzed_;
+  const int num_threads_;
   Solver solver_;
 };
 
@@ -148,13 +175,14 @@ EigenSparseCholesky* EigenSparseCholesky::Create(
       WithAMDOrdering;
   typedef Eigen::SupernodalLDLT<Eigen::SparseMatrix<double>,
                                 Eigen::Upper,
-                                Eigen::NaturalOrdering<int>,
+                                Eigen::HeaderOnlyMetisOrdering<int>,
                                 SupernodalExecutor>
-      WithNaturalOrdering;
+      WithNestedDissectionOrdering;
   if (ordering_type == AMD) {
     return new EigenSparseCholeskyTemplate<WithAMDOrdering>(num_threads);
   } else {
-    return new EigenSparseCholeskyTemplate<WithNaturalOrdering>(num_threads);
+    return new EigenSparseCholeskyTemplate<WithNestedDissectionOrdering>(
+        num_threads);
   }
 }
 

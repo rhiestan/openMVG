@@ -11,6 +11,10 @@ Local modifications:
     uses Eigen::SupernodalLDLT from DirectLUSolvers (third_party/DirectLUSolvers)
     instead of Eigen::SimplicialLDLT. SparseCholesky::Create takes the linear
     solver's num_threads, which the factorization uses through OpenMP when
-    ceres is built with OpenMP. openMVG_ceres is compiled as C++17.
+    ceres is built with OpenMP, and limits Eigen's dense product threads to
+    it. The NATURAL ordering (ceres' default, after its own block AMD
+    pre-ordering) is replaced by a nested dissection ordering of the scalar
+    matrix (DirectLUSolvers' HeaderOnlyMetisOrdering). openMVG_ceres is
+    compiled as C++17.
   * schur_eliminator_impl.h: std::random_shuffle (removed in C++17) replaced
     by std::shuffle.
