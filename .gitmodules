@@ -6,4 +6,4 @@
 	url = https://github.com/openMVG-thirdparty/osi_clp.git
 [submodule "src/dependencies/cereal"]
 	path = src/dependencies/cereal
-	url = https://github.com/openMVG-thirdparty/cereal.git
+	url = https://github.com/rhiestan/cereal.git

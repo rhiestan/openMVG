@@ -1,0 +1,215 @@
+# Build, test and package the openmvg-fast branch on Linux and Windows.
+# Pushing a tag v* additionally publishes the packages as a GitHub release.
+#
+# Only the bundled dependencies are used (src/third_party, src/dependencies
+# and Google Highway fetched by LeanSIFT), so the binaries do not depend on
+# system libraries other than the C/C++ and OpenMP runtimes. No GUI
+# (Qt5), OpenGL or OpenCV programs are built.
+
+name: openmvg-fast
+
+on:
+  push:
+    branches: [openmvg-fast]
+    tags: ['v*']
+  pull_request:
+    branches: [openmvg-fast]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LLVM_VERSION: 22.1.2
+  CTEST_OUTPUT_ON_FAILURE: 1
+  # Common configuration: release build of the command line programs and
+  # unit tests, portable x86-64 code (LeanSIFT, the matchers and Highway
+  # select SIMD code paths at run time), and no system libraries for the
+  # dependencies that are bundled.
+  # CMAKE_POLICY_VERSION_MINIMUM: several bundled libraries declare
+  # cmake_minimum_required versions below 3.5, which CMake 4 rejects.
+  CMAKE_COMMON_ARGS: >-
+    -G Ninja
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+    -DCMAKE_BUILD_TYPE=Release
+    -DOpenMVG_BUILD_TESTS=ON
+    -DOpenMVG_BUILD_EXAMPLES=OFF
+    -DOpenMVG_BUILD_DOC=OFF
+    -DOpenMVG_BUILD_SOFTWARES=ON
+    -DOpenMVG_BUILD_GUI_SOFTWARES=OFF
+    -DOpenMVG_BUILD_OPENGL_EXAMPLES=OFF
+    -DOpenMVG_USE_OPENCV=OFF
+    -DOpenMVG_USE_OCVSIFT=OFF
+    -DOpenMVG_USE_OPENMP=ON
+    -DTARGET_ARCHITECTURE=none
+    -DSCHUR_SPECIALIZATIONS=ON
+    -DLAPACK=OFF
+    -DSUITESPARSE=OFF
+    -DCXSPARSE=OFF
+    -DCMAKE_DISABLE_FIND_PACKAGE_JPEG=ON
+    -DCMAKE_DISABLE_FIND_PACKAGE_PNG=ON
+    -DCMAKE_DISABLE_FIND_PACKAGE_TIFF=ON
+    -DCMAKE_DISABLE_FIND_PACKAGE_Eigen3=ON
+    -DCMAKE_DISABLE_FIND_PACKAGE_Ceres=ON
+    -DCMAKE_DISABLE_FIND_PACKAGE_cereal=ON
+    -DCMAKE_DISABLE_FIND_PACKAGE_CoinUtils=ON
+    -DCMAKE_DISABLE_FIND_PACKAGE_Clp=ON
+    -DCMAKE_DISABLE_FIND_PACKAGE_Osi=ON
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 (glibc 2.35) so that the binaries run on older
+          # distributions too.
+          - name: linux-x64
+            os: ubuntu-22.04
+          - name: windows-x64
+            os: windows-2025
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Package name
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="${GITHUB_SHA::7}"
+          fi
+          echo "PKG_NAME=openMVG-fast-${version}-${{ matrix.name }}" >> "$GITHUB_ENV"
+
+      # --- Linux: GCC ---------------------------------------------------------
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ninja-build
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "STAGE_DIR=$RUNNER_TEMP/install" >> "$GITHUB_ENV"
+          cmake -S src -B build $CMAKE_COMMON_ARGS \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/install" \
+            -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_C_FLAGS="-march=x86-64" \
+            -DCMAKE_CXX_FLAGS="-march=x86-64" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+
+      # --- Windows: clang (GNU driver, MSVC ABI) with ThinLTO ----------------
+
+      - name: Cache LLVM (Windows)
+        if: runner.os == 'Windows'
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: C:\llvm
+          key: llvm-${{ env.LLVM_VERSION }}-x86_64-pc-windows-msvc
+
+      - name: Download LLVM (Windows)
+        if: runner.os == 'Windows' && steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          archive="clang+llvm-${LLVM_VERSION}-x86_64-pc-windows-msvc.tar.xz"
+          curl -sSfL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/$archive"
+          7z x "$RUNNER_TEMP/$archive" -so | 7z x -si -ttar -o'C:\llvm' > /dev/null
+          rm "$RUNNER_TEMP/$archive"
+
+      # The MSVC environment provides the Windows SDK, the MSVC runtime
+      # libraries and Ninja. It also puts Visual Studio's own clang on the
+      # path, so LLVM is referred to by absolute paths below.
+      - name: Set up the MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          llvm="C:/llvm/clang+llvm-${LLVM_VERSION}-x86_64-pc-windows-msvc"
+          stage="$(cygpath -m "$RUNNER_TEMP")/install"
+          echo "LLVM_DIR=$llvm" >> "$GITHUB_ENV"
+          echo "STAGE_DIR=$stage" >> "$GITHUB_ENV"
+          cmake -S src -B build $CMAKE_COMMON_ARGS \
+            -DCMAKE_INSTALL_PREFIX="$stage" \
+            -DCMAKE_C_COMPILER="$llvm/bin/clang.exe" \
+            -DCMAKE_CXX_COMPILER="$llvm/bin/clang++.exe" \
+            -DCMAKE_C_FLAGS="-march=x86-64 -flto=thin" \
+            -DCMAKE_CXX_FLAGS="-march=x86-64 -flto=thin" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -flto=thin"
+
+      # --- Common ---------------------------------------------------------------
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Copy the OpenMP runtime next to the programs (Windows)
+        if: runner.os == 'Windows'
+        run: cp "$LLVM_DIR/bin/libomp.dll" build/Windows-AMD64-Release/
+
+      - name: Unit tests
+        run: ctest --test-dir build --parallel 4
+
+      - name: Package
+        run: |
+          # Several install rules use the absolute CMAKE_INSTALL_PREFIX given
+          # at configure time, so it is not overridden here.
+          stage="$STAGE_DIR"
+          cmake --install build
+          pkg="dist/$PKG_NAME"
+          mkdir -p "$pkg"
+          cp -r "$stage/bin" "$pkg/"
+          cp "$stage"/lib*/openMVG/sensor_width_camera_database.txt "$pkg/"
+          cp LICENSE COPYRIGHT.md AUTHORS README.md "$pkg/"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp "$LLVM_DIR/bin/libomp.dll" "$pkg/bin/"
+            (cd dist && 7z a -tzip "$PKG_NAME.zip" "$PKG_NAME" > /dev/null)
+          else
+            tar -C dist -czf "dist/$PKG_NAME.tar.gz" "$PKG_NAME"
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG_NAME }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "openMVG-fast $GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag
