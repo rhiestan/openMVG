@@ -2,6 +2,9 @@
 # (third_party/LeanSIFT) for keypoint detection and description.
 add_library(openMVG_sift INTERFACE)
 target_link_libraries(openMVG_sift INTERFACE LeanSift::lsift)
+# For #include "nonFree/sift/SIFT_describer.hpp" in installed projects.
+target_include_directories(openMVG_sift INTERFACE
+  $<INSTALL_INTERFACE:include/openMVG_dependencies>)
 install(TARGETS openMVG_sift EXPORT openMVG-targets)
 install(
   FILES SIFT_describer.hpp SIFT_describer_io.hpp

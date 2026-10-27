@@ -102,8 +102,10 @@ add_subdirectory(fast)
 # Install Header only libraries if necessary
 ##
 if (DEFINED OpenMVG_USE_INTERNAL_EIGEN)
-  #Configure Eigen install
-  set(INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_PREFIX}/include/openMVG/third_party/eigen)
+  #Configure Eigen install. Eigen 3.4 replaces INCLUDE_INSTALL_DIR by its cache
+  #default (include/eigen3), but takes EIGEN_INCLUDE_INSTALL_DIR. Relative to
+  #the install prefix, as openMVG_numeric exports it.
+  set(EIGEN_INCLUDE_INSTALL_DIR include/openMVG/third_party/eigen)
   add_subdirectory(eigen)
 endif()
 

@@ -28,7 +28,7 @@ target_include_directories(openMVG_numeric
 )
 if (DEFINED OpenMVG_USE_INTERNAL_EIGEN)
   target_include_directories(openMVG_numeric PUBLIC
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_PREFIX}/include/openMVG/third_party/eigen/>)
+    $<INSTALL_INTERFACE:include/openMVG/third_party/eigen>)
 else()
   target_include_directories(openMVG_numeric PUBLIC
     $<INSTALL_INTERFACE:${EIGEN_INCLUDE_DIRS}>)

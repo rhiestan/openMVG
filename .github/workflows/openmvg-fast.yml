@@ -5,6 +5,10 @@
 # and Google Highway fetched by LeanSIFT), so the binaries do not depend on
 # system libraries other than the C/C++ and OpenMP runtimes. No GUI
 # (Qt5), OpenGL or OpenCV programs are built.
+#
+# The packages are full installations, usable by other CMake projects with
+# find_package(OpenMVG). No link time optimization: it would turn the static
+# libraries into compiler specific bitcode.
 
 name: openmvg-fast
 
@@ -105,11 +109,9 @@ jobs:
           cmake -S src -B build $CMAKE_COMMON_ARGS \
             -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/install" \
             -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
-            -DCMAKE_C_FLAGS="-march=x86-64" \
-            -DCMAKE_CXX_FLAGS="-march=x86-64" \
             -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
 
-      # --- Windows: clang (GNU driver, MSVC ABI) with ThinLTO ----------------
+      # --- Windows: clang (GNU driver, MSVC ABI) -------------------------------
 
       - name: Cache LLVM (Windows)
         if: runner.os == 'Windows'
@@ -148,9 +150,7 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$stage" \
             -DCMAKE_C_COMPILER="$llvm/bin/clang.exe" \
             -DCMAKE_CXX_COMPILER="$llvm/bin/clang++.exe" \
-            -DCMAKE_C_FLAGS="-march=x86-64 -flto=thin" \
-            -DCMAKE_CXX_FLAGS="-march=x86-64 -flto=thin" \
-            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -flto=thin"
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld"
 
       # --- Common ---------------------------------------------------------------
 
@@ -168,15 +168,47 @@ jobs:
         run: |
           # Several install rules use the absolute CMAKE_INSTALL_PREFIX given
           # at configure time, so it is not overridden here.
-          stage="$STAGE_DIR"
+          # The package is the whole installation (programs, headers,
+          # libraries and the CMake package files); the unit tests are not
+          # installed.
           cmake --install build
           pkg="dist/$PKG_NAME"
           mkdir -p "$pkg"
-          cp -r "$stage/bin" "$pkg/"
-          cp "$stage"/lib*/openMVG/sensor_width_camera_database.txt "$pkg/"
+          cp -r "$STAGE_DIR"/. "$pkg/"
           cp LICENSE COPYRIGHT.md AUTHORS README.md "$pkg/"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
+            # The OpenMP runtime the programs and libraries use.
             cp "$LLVM_DIR/bin/libomp.dll" "$pkg/bin/"
+            cp "$LLVM_DIR/lib/libomp.lib" "$pkg/lib/"
+          fi
+
+      # Build a project against the package at its new location, to check
+      # that the installation is relocatable and complete.
+      - name: Downstream build test
+        run: |
+          pkg="$PWD/dist/$PKG_NAME"
+          extra=()
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            pkg="$(cygpath -m "$pkg")"
+            extra=(-DCMAKE_CXX_COMPILER="$LLVM_DIR/bin/clang++.exe"
+                   -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld")
+          fi
+          cmake -S .github/ci/downstream -B build-downstream -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$pkg" "${extra[@]}"
+          cmake --build build-downstream
+          PATH="$pkg/bin:$PATH" ./build-downstream/downstream "$RUNNER_TEMP/sfm_data.json"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            # The same with MSVC, which links the package's OpenMP runtime.
+            cmake -S .github/ci/downstream -B build-downstream-msvc -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$pkg" \
+              -DCMAKE_CXX_COMPILER=cl
+            cmake --build build-downstream-msvc
+            PATH="$pkg/bin:$PATH" ./build-downstream-msvc/downstream "$RUNNER_TEMP/sfm_data_msvc.json"
+          fi
+
+      - name: Archive
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
             (cd dist && 7z a -tzip "$PKG_NAME.zip" "$PKG_NAME" > /dev/null)
           else
             tar -C dist -czf "dist/$PKG_NAME.tar.gz" "$PKG_NAME"

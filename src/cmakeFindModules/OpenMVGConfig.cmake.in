@@ -89,7 +89,25 @@ set(OpenMVG_USE_OPENMP "@OpenMVG_USE_OPENMP@")
 # Find transitive dependencies if required
 include(CMakeFindDependencyMacro)
 if (OpenMVG_USE_OPENMP)
-  find_dependency(OpenMP REQUIRED)
+  if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC"
+      AND EXISTS "${CURRENT_ROOT_INSTALL_DIR}/lib/libomp.lib")
+    # The package was built with clang and uses LLVM's OpenMP runtime
+    # (libomp, shipped with it). MSVC's -openmp would add its own runtime
+    # (vcomp) to the program, whose omp_* functions then mix with libomp's
+    # and break the parallel code (e.g. ceres). So OpenMP::OpenMP_CXX links
+    # libomp only, without -openmp.
+    if (TARGET OpenMP::OpenMP_CXX)
+      message(WARNING "OpenMVG: OpenMP::OpenMP_CXX is already defined; "
+        "MSVC's OpenMP runtime (vcomp) does not mix with the LLVM OpenMP "
+        "runtime this package uses. Find OpenMVG before OpenMP.")
+    else()
+      add_library(OpenMP::OpenMP_CXX INTERFACE IMPORTED)
+      set_property(TARGET OpenMP::OpenMP_CXX PROPERTY
+        INTERFACE_LINK_LIBRARIES "${CURRENT_ROOT_INSTALL_DIR}/lib/libomp.lib")
+    endif()
+  else()
+    find_dependency(OpenMP REQUIRED)
+  endif()
 endif()
 if (NOT OpenMVG_USE_INTERNAL_CEREAL)
   find_dependency(cereal REQUIRED)

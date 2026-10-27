@@ -10,12 +10,12 @@ add_library(openMVG_stlplus STATIC ${LIBSLTPLUS_SRCS})
 if(STLPLUS_INCLUDE_INSTALL_DIR)
   target_include_directories(openMVG_stlplus PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_PREFIX}/include/openMVG>
-    $<INSTALL_INTERFACE:${STLPLUS_INCLUDE_INSTALL_DIR}>/filesystemSimplified)
+    $<INSTALL_INTERFACE:include/openMVG>
+    $<INSTALL_INTERFACE:include/openMVG/third_party/stlplus3/filesystemSimplified>)
 else()
   target_include_directories(openMVG_stlplus PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_PREFIX}/include/stlplus>)
+    $<INSTALL_INTERFACE:include/stlplus>)
 endif()
 set_property(TARGET openMVG_stlplus PROPERTY FOLDER OpenMVG/3rdParty)
 
