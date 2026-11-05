@@ -1,9 +1,12 @@
-# Build, test and package the openmvg-fast branch on Linux and Windows.
+# Build, test and package the openmvg-fast branch on Linux (GCC), Windows
+# (clang) and macOS (AppleClang, arm64).
 # Pushing a tag v* additionally publishes the packages as a GitHub release.
 #
 # Only the bundled dependencies are used (src/third_party, src/dependencies
 # and Google Highway fetched by LeanSIFT), so the binaries do not depend on
-# system libraries other than the C/C++ and OpenMP runtimes. No GUI
+# system libraries other than the C/C++ and OpenMP runtimes. On macOS the
+# OpenMP runtime is Homebrew's libomp (`brew install libomp`), which the macOS
+# package needs at run time and for find_package(OpenMVG). No GUI
 # (Qt5), OpenGL or OpenCV programs are built.
 #
 # The packages are full installations, usable by other CMake projects with
@@ -76,6 +79,8 @@ jobs:
             os: ubuntu-22.04
           - name: windows-x64
             os: windows-2025
+          - name: macos-arm64
+            os: macos-15
     defaults:
       run:
         shell: bash
@@ -151,6 +156,25 @@ jobs:
             -DCMAKE_C_COMPILER="$llvm/bin/clang.exe" \
             -DCMAKE_CXX_COMPILER="$llvm/bin/clang++.exe" \
             -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld"
+
+      # --- macOS: AppleClang ------------------------------------------------------
+
+      # AppleClang has no OpenMP runtime of its own; Homebrew's libomp is used.
+      # OpenMP_ROOT lets find_package(OpenMP) find it, here and in the
+      # downstream build test.
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ninja libomp
+          echo "OpenMP_ROOT=$(brew --prefix libomp)" >> "$GITHUB_ENV"
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "STAGE_DIR=$RUNNER_TEMP/install" >> "$GITHUB_ENV"
+          cmake -S src -B build $CMAKE_COMMON_ARGS \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/install" \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 
       # --- Common ---------------------------------------------------------------
 
