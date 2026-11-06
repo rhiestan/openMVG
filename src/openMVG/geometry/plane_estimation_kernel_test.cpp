@@ -145,7 +145,11 @@ TEST(Kernel, RotatedGrid_RobustEstimation_Angular_Metric)
       {
         EXPECT_TRUE(AbsAngularError::Error(half_plane, points.col(i)) >= M_PI / 4.0);
       }
-      else
+      // The angular error is undefined for a point at the model's centroid
+      // (the bearing direction is rounding noise). This happens when the
+      // sampled grid points have a grid point as centroid, which depends on
+      // the standard library's random distributions.
+      else if ((points.col(i) - half_plane.second).norm() > 1e-8)
       {
         EXPECT_NEAR(0.0, AbsAngularError::Error(half_plane, points.col(i)), 1e-8);
       }
