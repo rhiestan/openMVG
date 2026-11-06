@@ -136,7 +136,9 @@ jobs:
 
       # The MSVC environment provides the Windows SDK, the MSVC runtime
       # libraries and Ninja. It also puts Visual Studio's own clang on the
-      # path, so LLVM is referred to by absolute paths below.
+      # path, so LLVM is referred to by absolute paths below. Likewise its
+      # library path contains Visual Studio's libomp.lib (for
+      # libomp140.x86_64.dll), so LLVM's libomp.lib is given explicitly.
       - name: Set up the MSVC environment (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -154,7 +156,8 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$stage" \
             -DCMAKE_C_COMPILER="$llvm/bin/clang.exe" \
             -DCMAKE_CXX_COMPILER="$llvm/bin/clang++.exe" \
-            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld"
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+            -DOpenMP_libomp_LIBRARY="$llvm/lib/libomp.lib"
 
       # --- macOS: AppleClang ------------------------------------------------------
 
@@ -214,6 +217,15 @@ jobs:
             # The OpenMP runtime the programs and libraries use.
             cp "$LLVM_DIR/bin/libomp.dll" "$pkg/bin/"
             cp "$LLVM_DIR/lib/libomp.lib" "$pkg/lib/"
+            # Every program must load the bundled runtime, not Visual
+            # Studio's (libomp140.x86_64.dll, vcomp140.dll).
+            for f in "$pkg"/bin/*.exe; do
+              omp_dlls="$("$LLVM_DIR/bin/llvm-objdump.exe" -p "$f" \
+                | awk '/DLL Name:/ {print $3}' | grep -i 'omp' || true)"
+              if [[ -n "$omp_dlls" && "$omp_dlls" != "libomp.dll" ]]; then
+                echo "$f does not use the bundled libomp: $omp_dlls"; exit 1
+              fi
+            done
           elif [[ "$RUNNER_OS" == "macOS" ]]; then
             # The OpenMP runtime and its headers (for find_package(OpenMVG)).
             cp "$OpenMP_ROOT/lib/libomp.dylib" "$pkg/lib/"
@@ -258,6 +270,14 @@ jobs:
               -DCMAKE_CXX_COMPILER=cl
             cmake --build build-downstream-msvc
             PATH="$pkg/bin:$PATH" ./build-downstream-msvc/downstream "$RUNNER_TEMP/sfm_data_msvc.json"
+            # Both must use the package's OpenMP runtime.
+            for f in build-downstream/downstream.exe build-downstream-msvc/downstream.exe; do
+              omp_dlls="$("$LLVM_DIR/bin/llvm-objdump.exe" -p "$f" \
+                | awk '/DLL Name:/ {print $3}' | grep -i 'omp' || true)"
+              if [[ "$omp_dlls" != "libomp.dll" ]]; then
+                echo "$f does not use the bundled libomp: $omp_dlls"; exit 1
+              fi
+            done
           fi
 
       - name: Archive

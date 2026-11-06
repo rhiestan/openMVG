@@ -105,9 +105,13 @@ if (OpenMVG_USE_OPENMP)
       set_property(TARGET OpenMP::OpenMP_CXX PROPERTY
         INTERFACE_LINK_LIBRARIES "${CURRENT_ROOT_INSTALL_DIR}/lib/libomp.lib")
     endif()
-  elseif (APPLE AND EXISTS "${CURRENT_ROOT_INSTALL_DIR}/lib/libomp.dylib")
-    # The package bundles the OpenMP runtime (libomp) and its headers, as
-    # AppleClang has none; look for them in the package first.
+  elseif ((APPLE AND EXISTS "${CURRENT_ROOT_INSTALL_DIR}/lib/libomp.dylib")
+      OR (WIN32 AND EXISTS "${CURRENT_ROOT_INSTALL_DIR}/lib/libomp.lib"))
+    # The package bundles the OpenMP runtime (libomp); look for it in the
+    # package first. On macOS AppleClang has no runtime of its own (the
+    # package has the headers too). On Windows Visual Studio's library path
+    # contains its own libomp.lib, for a different DLL
+    # (libomp140.x86_64.dll).
     set(_OpenMVG_saved_CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH}")
     list(INSERT CMAKE_PREFIX_PATH 0 "${CURRENT_ROOT_INSTALL_DIR}")
     find_package(OpenMP)
