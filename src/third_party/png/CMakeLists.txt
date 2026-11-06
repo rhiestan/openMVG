@@ -66,6 +66,9 @@ endif(MSVC)
 add_library(openMVG_png STATIC ${libpng_sources})
 target_link_libraries(openMVG_png PUBLIC openMVG_zlib ${M_LIBRARY})
 set_property(TARGET openMVG_png PROPERTY FOLDER OpenMVG/3rdParty)
+# The ARM NEON filter code (arm/*.c) is not bundled; without this libpng would
+# reference it on every ARM compiler that defines __ARM_NEON__ (e.g. arm64).
+target_compile_definitions(openMVG_png PRIVATE PNG_ARM_NEON_OPT=0)
 
 target_include_directories(openMVG_png PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
