@@ -4,10 +4,9 @@
 #
 # Only the bundled dependencies are used (src/third_party, src/dependencies
 # and Google Highway fetched by LeanSIFT), so the binaries do not depend on
-# system libraries other than the C/C++ and OpenMP runtimes. On macOS the
-# OpenMP runtime is Homebrew's libomp (`brew install libomp`), which the macOS
-# package needs at run time and for find_package(OpenMVG). No GUI
-# (Qt5), OpenGL or OpenCV programs are built.
+# system libraries other than the C/C++ runtime. The OpenMP runtime (LLVM's
+# libomp) is bundled with the Windows and macOS packages; on macOS it is
+# Homebrew's. No GUI (Qt5), OpenGL or OpenCV programs are built.
 #
 # The packages are full installations, usable by other CMake projects with
 # find_package(OpenMVG). No link time optimization: it would turn the static
@@ -159,14 +158,24 @@ jobs:
 
       # --- macOS: AppleClang ------------------------------------------------------
 
-      # AppleClang has no OpenMP runtime of its own; Homebrew's libomp is used.
-      # OpenMP_ROOT lets find_package(OpenMP) find it, here and in the
-      # downstream build test.
+      # AppleClang has no OpenMP runtime of its own; Homebrew's libomp is used
+      # and bundled with the package. The build uses a copy whose install
+      # name is @rpath/libomp.dylib, so that the programs find the bundled
+      # copy (through their rpath @loader_path/../lib) and not Homebrew's.
+      # OpenMP_ROOT lets find_package(OpenMP) find the copy.
       - name: Install build tools (macOS)
         if: runner.os == 'macOS'
         run: |
           brew install ninja libomp
-          echo "OpenMP_ROOT=$(brew --prefix libomp)" >> "$GITHUB_ENV"
+          brew_omp="$(brew --prefix libomp)"
+          omp="$RUNNER_TEMP/libomp"
+          mkdir -p "$omp/lib"
+          cp -RL "$brew_omp/include" "$omp/"
+          cp -L "$brew_omp/lib/libomp.dylib" "$omp/lib/"
+          chmod u+w "$omp/lib/libomp.dylib"
+          install_name_tool -id @rpath/libomp.dylib "$omp/lib/libomp.dylib"
+          codesign --force --sign - "$omp/lib/libomp.dylib"
+          echo "OpenMP_ROOT=$omp" >> "$GITHUB_ENV"
 
       - name: Configure (macOS)
         if: runner.os == 'macOS'
@@ -174,7 +183,8 @@ jobs:
           echo "STAGE_DIR=$RUNNER_TEMP/install" >> "$GITHUB_ENV"
           cmake -S src -B build $CMAKE_COMMON_ARGS \
             -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/install" \
-            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_INSTALL_RPATH=@loader_path/../lib
 
       # --- Common ---------------------------------------------------------------
 
@@ -204,6 +214,21 @@ jobs:
             # The OpenMP runtime the programs and libraries use.
             cp "$LLVM_DIR/bin/libomp.dll" "$pkg/bin/"
             cp "$LLVM_DIR/lib/libomp.lib" "$pkg/lib/"
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            # The OpenMP runtime and its headers (for find_package(OpenMVG)).
+            cp "$OpenMP_ROOT/lib/libomp.dylib" "$pkg/lib/"
+            cp -R "$OpenMP_ROOT/include/." "$pkg/include/"
+            # Every program must load the bundled runtime.
+            for f in "$pkg"/bin/*; do
+              file "$f" | grep -q Mach-O || continue
+              omp_ref="$(otool -L "$f" | grep libomp || true)"
+              [[ -z "$omp_ref" ]] && continue
+              if [[ "$omp_ref" != *@rpath/libomp.dylib* ]] \
+                || ! otool -l "$f" | grep -q '@loader_path/../lib'; then
+                echo "$f does not use the bundled libomp:"
+                otool -L "$f"; otool -l "$f" | grep -A2 LC_RPATH; exit 1
+              fi
+            done
           fi
 
       # Build a project against the package at its new location, to check
@@ -211,6 +236,11 @@ jobs:
       - name: Downstream build test
         run: |
           pkg="$PWD/dist/$PKG_NAME"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            # The package's own libomp must be used, not the build's copy.
+            mv "$OpenMP_ROOT" "$OpenMP_ROOT.unused"
+            unset OpenMP_ROOT
+          fi
           extra=()
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             pkg="$(cygpath -m "$pkg")"
