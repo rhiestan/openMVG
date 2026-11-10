@@ -114,7 +114,13 @@ if (OpenMVG_USE_OPENMP)
     # package has the headers too). On Windows Visual Studio's library path
     # contains its own libomp.lib, for a different DLL
     # (libomp140.x86_64.dll). On Linux clang would otherwise link the
-    # system's libomp.
+    # system's libomp: FindOpenMP looks for the library of -fopenmp's -lomp
+    # only in the compiler's implicit link directories, so it is given
+    # directly.
+    if (UNIX AND NOT APPLE AND NOT OpenMP_omp_LIBRARY)
+      set(OpenMP_omp_LIBRARY "${CURRENT_ROOT_INSTALL_DIR}/lib/libomp.so"
+        CACHE FILEPATH "OpenMP runtime bundled with OpenMVG")
+    endif()
     set(_OpenMVG_saved_CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH}")
     list(INSERT CMAKE_PREFIX_PATH 0 "${CURRENT_ROOT_INSTALL_DIR}")
     find_package(OpenMP)

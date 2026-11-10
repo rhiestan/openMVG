@@ -123,7 +123,7 @@ jobs:
             -DCMAKE_C_COMPILER="$LLVM_DIR/bin/clang" \
             -DCMAKE_CXX_COMPILER="$LLVM_DIR/bin/clang++" \
             -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
-            -DOpenMP_libomp_LIBRARY="$LLVM_DIR/lib/libomp.so" \
+            -DOpenMP_omp_LIBRARY="$LLVM_DIR/lib/libomp.so" \
             -DCMAKE_INSTALL_RPATH='$ORIGIN/../lib'
 
       # --- Windows: clang (GNU driver, MSVC ABI) -------------------------------
@@ -305,7 +305,8 @@ jobs:
             if [[ -z "$omp_path" \
                 || "$(realpath "$omp_path")" != "$(realpath "$pkg/lib/libomp.so.5")" ]]; then
               echo "downstream does not use the bundled libomp:"
-              ldd build-downstream/downstream; exit 1
+              ldd build-downstream/downstream
+              grep -E "OpenMP_(omp|libomp)_LIBRARY" build-downstream/CMakeCache.txt; exit 1
             fi
           fi
           if [[ "$RUNNER_OS" == "Windows" ]]; then
