@@ -1,12 +1,11 @@
-# Build, test and package the openmvg-fast branch on Linux (GCC), Windows
+# Build, test and package the openmvg-fast branch on Linux (clang), Windows
 # (clang) and macOS (AppleClang, arm64).
 # Pushing a tag v* additionally publishes the packages as a GitHub release.
 #
 # Only the bundled dependencies are used (src/third_party, src/dependencies
 # and Google Highway fetched by LeanSIFT), so the binaries do not depend on
 # system libraries other than the C/C++ runtime. The OpenMP runtime (LLVM's
-# libomp) is bundled with the Windows and macOS packages; on macOS it is
-# Homebrew's. No GUI (Qt5), OpenGL or OpenCV programs are built.
+# libomp) is bundled with all packages; on macOS it is Homebrew's. No GUI (Qt5), OpenGL or OpenCV programs are built.
 #
 # The packages are full installations, usable by other CMake projects with
 # find_package(OpenMVG). No link time optimization: it would turn the static
@@ -98,13 +97,22 @@ jobs:
           fi
           echo "PKG_NAME=openMVG-fast-${version}-${{ matrix.name }}" >> "$GITHUB_ENV"
 
-      # --- Linux: GCC ---------------------------------------------------------
+      # --- Linux: clang -------------------------------------------------------
 
+      # clang and its OpenMP runtime (libomp) from apt.llvm.org, of the same
+      # major version as on Windows. libomp is bundled with the package; the
+      # programs find it through their rpath $ORIGIN/../lib.
       - name: Install build tools (Linux)
         if: runner.os == 'Linux'
         run: |
+          major="${LLVM_VERSION%%.*}"
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-$major main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
           sudo apt-get update -y
-          sudo apt-get install -y ninja-build
+          sudo apt-get install -y ninja-build "clang-$major" "libomp-$major-dev"
+          echo "LLVM_DIR=/usr/lib/llvm-$major" >> "$GITHUB_ENV"
 
       - name: Configure (Linux)
         if: runner.os == 'Linux'
@@ -112,8 +120,11 @@ jobs:
           echo "STAGE_DIR=$RUNNER_TEMP/install" >> "$GITHUB_ENV"
           cmake -S src -B build $CMAKE_COMMON_ARGS \
             -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/install" \
-            -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
-            -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+            -DCMAKE_C_COMPILER="$LLVM_DIR/bin/clang" \
+            -DCMAKE_CXX_COMPILER="$LLVM_DIR/bin/clang++" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
+            -DOpenMP_libomp_LIBRARY="$LLVM_DIR/lib/libomp.so" \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN/../lib'
 
       # --- Windows: clang (GNU driver, MSVC ABI) -------------------------------
 
@@ -226,6 +237,29 @@ jobs:
                 echo "$f does not use the bundled libomp: $omp_dlls"; exit 1
               fi
             done
+          elif [[ "$RUNNER_OS" == "Linux" ]]; then
+            # The OpenMP runtime the programs use (by its soname), and the
+            # link name for find_package(OpenMVG).
+            cp -L "$LLVM_DIR/lib/libomp.so.5" "$pkg/lib/"
+            ln -s libomp.so.5 "$pkg/lib/libomp.so"
+            # Every program must load the bundled runtime, and none GCC's.
+            bundled="$(realpath "$pkg/lib/libomp.so.5")"
+            n_omp=0
+            for f in "$pkg"/bin/*; do
+              file "$f" | grep -q ELF || continue
+              omp_libs="$(ldd "$f" | grep omp || true)"
+              [[ -z "$omp_libs" ]] && continue
+              omp_path="$(ldd "$f" | awk '$1 == "libomp.so.5" {print $3}')"
+              if [[ -z "$omp_path" || "$(realpath "$omp_path")" != "$bundled" ]] \
+                || [[ "$omp_libs" == *gomp* ]]; then
+                echo "$f does not use the bundled libomp:"; ldd "$f"; exit 1
+              fi
+              n_omp=$((n_omp + 1))
+            done
+            echo "$n_omp programs use the bundled libomp"
+            if [[ "$n_omp" -eq 0 ]]; then
+              echo "No program uses OpenMP"; exit 1
+            fi
           elif [[ "$RUNNER_OS" == "macOS" ]]; then
             # The OpenMP runtime and its headers (for find_package(OpenMVG)).
             cp "$OpenMP_ROOT/lib/libomp.dylib" "$pkg/lib/"
@@ -254,7 +288,9 @@ jobs:
             unset OpenMP_ROOT
           fi
           extra=()
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            extra=(-DCMAKE_CXX_COMPILER="$LLVM_DIR/bin/clang++")
+          elif [[ "$RUNNER_OS" == "Windows" ]]; then
             pkg="$(cygpath -m "$pkg")"
             extra=(-DCMAKE_CXX_COMPILER="$LLVM_DIR/bin/clang++.exe"
                    -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld")
@@ -263,6 +299,15 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$pkg" "${extra[@]}"
           cmake --build build-downstream
           PATH="$pkg/bin:$PATH" ./build-downstream/downstream "$RUNNER_TEMP/sfm_data.json"
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            # It must use the package's OpenMP runtime, not the system's.
+            omp_path="$(ldd build-downstream/downstream | awk '$1 == "libomp.so.5" {print $3}')"
+            if [[ -z "$omp_path" \
+                || "$(realpath "$omp_path")" != "$(realpath "$pkg/lib/libomp.so.5")" ]]; then
+              echo "downstream does not use the bundled libomp:"
+              ldd build-downstream/downstream; exit 1
+            fi
+          fi
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             # The same with MSVC, which links the package's OpenMP runtime.
             cmake -S .github/ci/downstream -B build-downstream-msvc -G Ninja \
