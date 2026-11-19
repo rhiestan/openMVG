@@ -6,434 +6,618 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+// Export an OpenMVG SfM_Data scene as a COLMAP sparse model
+// (cameras, images and points3D, in COLMAP's text and/or binary format).
+//
+// The model is exact: camera models are only mapped to COLMAP models with
+// identical projection formulas, all floating-point values are written so
+// that they read back bit-exactly, and pixel coordinates are converted to
+// COLMAP's convention. OpenMVG puts pixel (0,0) at the centre of the top-left
+// pixel, COLMAP at its top-left corner, so principal points and 2D
+// observations are shifted by +0.5 pixel.
+
 #include "openMVG/cameras/Camera_Common.hpp"
-#include "openMVG/cameras/Camera_Pinhole.hpp"
-#include "openMVG/cameras/Camera_Pinhole_Radial.hpp"
-#include "openMVG/cameras/Camera_Pinhole_Fisheye.hpp"
 #include "openMVG/cameras/Camera_Intrinsics.hpp"
-#include "openMVG/cameras/Camera_undistort_image.hpp"
-#include "openMVG/features/feature.hpp"
 #include "openMVG/image/image_io.hpp"
 #include "openMVG/sfm/sfm_data.hpp"
 #include "openMVG/sfm/sfm_data_io.hpp"
-#include "openMVG/sfm/sfm_data_colorization.hpp"
-#include "openMVG/system/loggerprogress.hpp"
+#include "openMVG/system/logger.hpp"
 
 #include "third_party/cmdLine/cmdLine.h"
 #include "third_party/stlplus3/filesystemSimplified/file_system.hpp"
 
-#include <iomanip>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
-#include <sstream>
+#include <cstring>
+#include <fstream>
+#include <limits>
+#include <map>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 using namespace openMVG;
 using namespace openMVG::cameras;
-using namespace openMVG::geometry;
-using namespace openMVG::image;
 using namespace openMVG::sfm;
-using namespace openMVG::features;
 
+namespace {
 
-bool CreateLineCameraFile(  const IndexT camera_id, 
-                            std::shared_ptr<openMVG::cameras::IntrinsicBase> intrinsic,
-                            std::string & camera_line,
-                            const int& floating_point_precision_digit)
+// OpenMVG puts pixel (0,0) at the centre of the top-left pixel, COLMAP at its
+// top-left corner.
+constexpr double kPixelOffset = 0.5;
 
+constexpr uint64_t kInvalidPoint3DId = std::numeric_limits<uint64_t>::max();
+
+// COLMAP camera model ids (colmap/sensor/models/base.h, enum CameraModelId).
+enum ColmapModelId : int
 {
-  std::stringstream came_line_ss;
-  came_line_ss.precision(floating_point_precision_digit);
+  COLMAP_SIMPLE_PINHOLE = 0,
+  COLMAP_PINHOLE = 1,
+  COLMAP_SIMPLE_RADIAL = 2,
+  COLMAP_RADIAL = 3,
+  COLMAP_OPENCV = 4,
+  COLMAP_OPENCV_FISHEYE = 5,
+  COLMAP_FULL_OPENCV = 6
+};
 
-  EINTRINSIC current_type = intrinsic->getType();
-  switch(current_type) 
+struct ColmapCamera
+{
+  uint32_t id = 0;
+  int model_id = -1;
+  std::string model_name;
+  uint64_t width = 0, height = 0;
+  std::vector<double> params;
+};
+
+struct ColmapPoint2D
+{
+  double x, y;
+  uint64_t point3D_id;
+};
+
+struct ColmapImage
+{
+  uint32_t id = 0;
+  double qw, qx, qy, qz;
+  double tx, ty, tz;
+  uint32_t camera_id = 0;
+  std::string name;
+  std::vector<ColmapPoint2D> points2D;
+  // OpenMVG pixel coordinates of the points (used to sample colors)
+  std::vector<Vec2> openmvg_xy;
+  std::string image_path;
+};
+
+struct ColmapPoint3D
+{
+  uint64_t id = 0;
+  double x, y, z;
+  uint8_t r = 128, g = 128, b = 128;
+  double error = 0.0;
+  bool has_color = false;
+  std::vector<std::pair<uint32_t, uint32_t>> track; // (image_id, point2D_idx)
+};
+
+struct ColmapModel
+{
+  std::map<uint32_t, ColmapCamera> cameras;
+  std::vector<ColmapImage> images;
+  std::vector<ColmapPoint3D> points3D;
+};
+
+/// Map an OpenMVG intrinsic to the COLMAP camera model with identical
+/// projection formulas. Returns false if there is no exact equivalent.
+bool ToColmapCamera(const IntrinsicBase & intrinsic, ColmapCamera & camera)
+{
+  // OpenMVG pinhole parameters start with f, cx, cy
+  const std::vector<double> p = intrinsic.getParams();
+  camera.width = intrinsic.w();
+  camera.height = intrinsic.h();
+  const EINTRINSIC type = intrinsic.getType();
+  if (!isPinhole(type) || p.size() < 3)
+    return false;
+  const double f = p[0];
+  const double cx = p[1] + kPixelOffset;
+  const double cy = p[2] + kPixelOffset;
+  switch (type)
   {
-    case PINHOLE_CAMERA: 
-      //OpenMVG's PINHOLE_CAMERA corresponds to Colmap's SIMPLE_PINHOLE
-      //Parameters: f, cx, cy  
-      {
-        std::shared_ptr<openMVG::cameras::Pinhole_Intrinsic> pinhole_intrinsic(
-          dynamic_cast<openMVG::cameras::Pinhole_Intrinsic * >(intrinsic->clone()));
-        
-        came_line_ss << camera_id << " " << 
-          "SIMPLE_PINHOLE" << " " <<
-          pinhole_intrinsic->w() << " " << 
-          pinhole_intrinsic->h() << " " <<
-          pinhole_intrinsic->focal() << " " << 
-          pinhole_intrinsic->principal_point().x() << " " << 
-          pinhole_intrinsic->principal_point().y() << "\n";
-      }
-      break;
+    case PINHOLE_CAMERA:
+      camera.model_id = COLMAP_PINHOLE;
+      camera.model_name = "PINHOLE";
+      camera.params = {f, f, cx, cy};
+      return true;
     case PINHOLE_CAMERA_RADIAL1:
-      //OpenMVG's PINHOLE_CAMERA_RADIAL1 corresponds to Colmap's SIMPLE_RADIAL
-      //Parameters: f, cx, cy, k1   
-      {
-        std::shared_ptr<openMVG::cameras::Pinhole_Intrinsic_Radial_K1> pinhole_intrinsic_radial(
-            dynamic_cast<openMVG::cameras::Pinhole_Intrinsic_Radial_K1 * >(intrinsic->clone()));
-
-        came_line_ss << camera_id << " " << 
-          "SIMPLE_RADIAL" << " " <<
-          pinhole_intrinsic_radial->w() << " " << 
-          pinhole_intrinsic_radial->h() << " " <<
-          pinhole_intrinsic_radial->focal() << " " << 
-          pinhole_intrinsic_radial->principal_point().x() << " " << 
-          pinhole_intrinsic_radial->principal_point().y() << " " << 
-          pinhole_intrinsic_radial->getParams().at(3) << "\n";   //k1
-      }
-      break;      
-    case PINHOLE_CAMERA_RADIAL3: 
-      //OpenMVG's PINHOLE_CAMERA_RADIAL3 corresponds to Colmap's FULL_OPENCV
-      //Parameters: fx, fy, cx, cy, k1, k2, p1, p2, k3, k4, k5, k6
-      {
-        std::shared_ptr<openMVG::cameras::Pinhole_Intrinsic_Radial_K3> pinhole_intrinsic_radial(
-            dynamic_cast<openMVG::cameras::Pinhole_Intrinsic_Radial_K3 * >(intrinsic->clone()));
-        
-        came_line_ss << camera_id << " " << 
-          "FULL_OPENCV" << " " <<
-          pinhole_intrinsic_radial->w() << " " << 
-          pinhole_intrinsic_radial->h() << " " <<
-          pinhole_intrinsic_radial->focal() << " " << 
-          pinhole_intrinsic_radial->focal() << " " << 
-          pinhole_intrinsic_radial->principal_point().x() << " " << 
-          pinhole_intrinsic_radial->principal_point().y() << " " << 
-          pinhole_intrinsic_radial->getParams().at(3) << " " << //k1
-          pinhole_intrinsic_radial->getParams().at(4) << " " << //k2
-          0.0 << " " << //p1
-          0.0 << " " << //p2
-          pinhole_intrinsic_radial->getParams().at(5) << " " << //k3
-          0.0 << " " << // k4
-          0.0 << " " << // k5
-          0.0 << "\n";  // k6
-      }
-      break; 
-    case PINHOLE_CAMERA_BROWN: 
-      OPENMVG_LOG_ERROR << "PINHOLE_CAMERA_BROWN is not supported. Aborting ...";
+      // x_d = x (1 + k1 r^2)
+      if (p.size() != 4) return false;
+      camera.model_id = COLMAP_SIMPLE_RADIAL;
+      camera.model_name = "SIMPLE_RADIAL";
+      camera.params = {f, cx, cy, p[3]};
+      return true;
+    case PINHOLE_CAMERA_RADIAL3:
+      // x_d = x (1 + k1 r^2 + k2 r^4 + k3 r^6)
+      if (p.size() != 6) return false;
+      camera.model_id = COLMAP_FULL_OPENCV;
+      camera.model_name = "FULL_OPENCV";
+      camera.params = {f, f, cx, cy, p[3], p[4], 0.0, 0.0, p[5], 0.0, 0.0, 0.0};
+      return true;
+    case PINHOLE_CAMERA_BROWN:
+      // OpenMVG: tx = t2 (r^2 + 2x^2) + 2 t1 x y, ty = t1 (r^2 + 2y^2) + 2 t2 x y
+      // OpenCV:  dx = p2 (r^2 + 2x^2) + 2 p1 x y, dy = p1 (r^2 + 2y^2) + 2 p2 x y
+      // so p1 = t1 and p2 = t2. OpenMVG params: f cx cy k1 k2 k3 t1 t2
+      if (p.size() != 8) return false;
+      camera.model_id = COLMAP_FULL_OPENCV;
+      camera.model_name = "FULL_OPENCV";
+      camera.params = {f, f, cx, cy, p[3], p[4], p[6], p[7], p[5], 0.0, 0.0, 0.0};
+      return true;
+    case PINHOLE_CAMERA_FISHEYE:
+      // theta_d = theta (1 + k1 theta^2 + k2 theta^4 + k3 theta^6 + k4 theta^8)
+      if (p.size() != 7) return false;
+      camera.model_id = COLMAP_OPENCV_FISHEYE;
+      camera.model_name = "OPENCV_FISHEYE";
+      camera.params = {f, f, cx, cy, p[3], p[4], p[5], p[6]};
+      return true;
+    default:
       return false;
-      break;      
-    case PINHOLE_CAMERA_FISHEYE: 
-      //OpenMVG's PINHOLE_CAMERA_FISHEYE corresponds to Colmap's OPENCV_FISHEYE
-      //Parameters: fx, fy, cx, cy, k1, k2, k3, k4
-      {
-        std::shared_ptr<openMVG::cameras::Pinhole_Intrinsic_Fisheye> pinhole_intrinsic_fisheye(
-            dynamic_cast<openMVG::cameras::Pinhole_Intrinsic_Fisheye * >(intrinsic->clone()));
-        
-        came_line_ss << camera_id << " " << 
-          "OPENCV_FISHEYE" << " " <<
-          pinhole_intrinsic_fisheye->w() << " " << 
-          pinhole_intrinsic_fisheye->h() << " " <<
-          pinhole_intrinsic_fisheye->focal() << " " << 
-          pinhole_intrinsic_fisheye->focal() << " " << 
-          pinhole_intrinsic_fisheye->principal_point().x() << " " << 
-          pinhole_intrinsic_fisheye->principal_point().y() << " " << 
-          pinhole_intrinsic_fisheye->getParams().at(3) << " " << //k1
-          pinhole_intrinsic_fisheye->getParams().at(4) << " " << //k2
-          pinhole_intrinsic_fisheye->getParams().at(5) << " " << //k3
-          pinhole_intrinsic_fisheye->getParams().at(6) << " " << "\n"; //k4
-      }
-      break; 
-    default: OPENMVG_LOG_ERROR << "Camera Type " << current_type << " is not supported. Aborting ...";
-    return false;
   }
-  camera_line = came_line_ss.str();
-  return true;
 }
 
-bool CreateCameraFile( const SfM_Data & sfm_data, 
-                      const std::string & sCamerasFilename,
-                      const int& floating_point_precision_digit)
+const char * IntrinsicTypeName(EINTRINSIC type)
 {
-   /* cameras.txt
-      # Camera list with one line of data per camera:
-      #   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]
-      # Number of cameras: X
-  */ 
-  std::ofstream camera_file( sCamerasFilename );
-  camera_file.precision(floating_point_precision_digit);
-
-  if ( ! camera_file )
+  switch (type)
   {
-    OPENMVG_LOG_ERROR << "Cannot write file" << sCamerasFilename;
-    return false;
+    case PINHOLE_CAMERA: return "pinhole";
+    case PINHOLE_CAMERA_RADIAL1: return "pinhole_radial_k1";
+    case PINHOLE_CAMERA_RADIAL3: return "pinhole_radial_k3";
+    case PINHOLE_CAMERA_BROWN: return "pinhole_brown_t2";
+    case PINHOLE_CAMERA_FISHEYE: return "fisheye";
+    case CAMERA_SPHERICAL: return "spherical";
+    default: return "unknown";
   }
-  camera_file << "# Camera list with one line of data per camera:\n";
-  camera_file << "#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n";
-  camera_file << "# Number of cameras: X\n";
-
-  std::vector<std::string> camera_lines;
-  system::LoggerProgress my_progress_bar( sfm_data.GetIntrinsics().size(), "- CREATE CAMERA FILE -" );
-  for (Intrinsics::const_iterator iter = sfm_data.GetIntrinsics().begin();
-    iter != sfm_data.GetIntrinsics().end(); ++iter, ++my_progress_bar)
-  {
-    const IndexT camera_id = iter->first;
-    std::shared_ptr<openMVG::cameras::IntrinsicBase> intrinsic = iter->second;
-    std::string camera_line;
-    if (CreateLineCameraFile(camera_id, intrinsic, camera_line, floating_point_precision_digit)) 
-    {
-      camera_lines.push_back(camera_line);
-    } 
-    else 
-    {
-      return false;
-    }
-  }
-  for (auto const& camera_line: camera_lines)
-  {
-    camera_file << camera_line << "\n";
-  }
-  return true;
 }
 
-bool CreateImageFile( const SfM_Data & sfm_data,
-                      const std::string & sImagesFilename,
-                      const int& floating_point_precision_digit)
-
+/// Image name relative to the root path, with forward slashes.
+std::string ColmapImageName(const std::string & root_path, std::string name)
 {
- /* images.txt
-      # Image list with two lines of data per image:
-      #   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME
-      #   POINTS2D[] as (X, Y, POINT3D_ID)
-      # Number of images: X, mean observations per image: Y
-  */
-
-  // Header
-  std::ofstream images_file( sImagesFilename );
-
-  if ( ! images_file )
+  std::replace(name.begin(), name.end(), '\\', '/');
+  if (!root_path.empty() && stlplus::is_full_path(name))
   {
-    OPENMVG_LOG_ERROR << "Cannot write file" << sImagesFilename;
-    return false;
+    std::string root = root_path;
+    std::replace(root.begin(), root.end(), '\\', '/');
+    while (!root.empty() && root.back() == '/')
+      root.pop_back();
+    if (name.size() > root.size() + 1 &&
+        name.compare(0, root.size(), root) == 0 && name[root.size()] == '/')
+      name = name.substr(root.size() + 1);
   }
-  images_file << "# Image list with two lines of data per image:\n";
-  images_file << "#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n";
-  images_file << "#   POINTS2D[] as (X, Y, POINT3D_ID)\n";
-  images_file << "# Number of images: X, mean observations per image: Y\n";
+  while (name.compare(0, 2, "./") == 0)
+    name = name.substr(2);
+  return name;
+}
 
-  std::map< IndexT, std::vector< std::tuple<double, double, IndexT> > > viewIdToPoints2D;
-  const Landmarks & landmarks = sfm_data.GetLandmarks();
+/// Directory the images are read from: a relative root path is resolved
+/// against the directory of the sfm_data file (falling back to the current
+/// directory if it does not exist there).
+std::string ResolveRootPath(const std::string & root_path,
+                            const std::string & sfm_data_filename)
+{
+  if (!root_path.empty() && stlplus::is_full_path(root_path))
+    return root_path;
+  const std::string sfm_dir = stlplus::folder_part(sfm_data_filename);
+  if (sfm_dir.empty())
+    return root_path;
+  const std::string candidate =
+    root_path.empty() ? sfm_dir : stlplus::create_filespec(sfm_dir, root_path);
+  if (stlplus::folder_exists(candidate))
+    return candidate;
+  if (!root_path.empty() && stlplus::folder_exists(root_path))
   {
-    for ( Landmarks::const_iterator iterLandmarks = landmarks.begin();
-          iterLandmarks != landmarks.end(); ++iterLandmarks)
-    {
-      const IndexT point3d_id = iterLandmarks->first;
+    OPENMVG_LOG_WARNING << "Root path \"" << root_path
+      << "\" not found next to the sfm_data file; using it relative to the "
+         "current directory.";
+    return root_path;
+  }
+  return candidate;
+}
 
-      // Tally set of feature observations
-      const Observations & obs = iterLandmarks->second.obs;
-      for ( Observations::const_iterator itObs = obs.begin(); itObs != obs.end(); ++itObs )
-      {
-        const IndexT currentViewId = itObs->first;
-        const Observation & ob = itObs->second;
-        viewIdToPoints2D[currentViewId].push_back(std::make_tuple(ob.x( 0 ), ob.x( 1 ), point3d_id));
-      }
+/// Build the COLMAP model. Only views with a pose and an intrinsic that has
+/// an exact COLMAP equivalent are exported.
+ColmapModel BuildModel(const SfM_Data & sfm_data, const std::string & image_root)
+{
+  ColmapModel model;
+
+  // Cameras: one per intrinsic
+  std::map<IndexT, bool> supported_intrinsic;
+  for (const auto & it : sfm_data.GetIntrinsics())
+  {
+    ColmapCamera camera;
+    camera.id = it.first;
+    const bool ok = it.second && ToColmapCamera(*it.second, camera);
+    supported_intrinsic[it.first] = ok;
+    if (ok)
+      continue; // added below when a view uses it
+    OPENMVG_LOG_WARNING << "Intrinsic " << it.first << " ("
+      << (it.second ? IntrinsicTypeName(it.second->getType()) : "null")
+      << ") has no exact COLMAP equivalent; its views are not exported.";
+  }
+
+  // Images: views with a pose and a supported intrinsic
+  std::map<IndexT, size_t> view_to_image; // view id -> index in model.images
+  size_t skipped_views = 0;
+  for (const auto & it : sfm_data.GetViews())
+  {
+    const View * view = it.second.get();
+    if (!view || !sfm_data.IsPoseAndIntrinsicDefined(view))
+      continue;
+    if (!supported_intrinsic[view->id_intrinsic])
+    {
+      ++skipped_views;
+      continue;
     }
-  }
-
-  {
-    system::LoggerProgress my_progress_bar( sfm_data.GetViews().size(), "- CREATE IMAGE FILE -" );
-
-    for (Views::const_iterator iter = sfm_data.GetViews().begin();
-         iter != sfm_data.GetViews().end(); ++iter, ++my_progress_bar)
+    if (model.cameras.count(view->id_intrinsic) == 0)
     {
-      const View * view = iter->second.get();
+      ColmapCamera camera;
+      camera.id = view->id_intrinsic;
+      ToColmapCamera(*sfm_data.GetIntrinsics().at(view->id_intrinsic), camera);
+      model.cameras[camera.id] = camera;
+    }
 
-      if ( !sfm_data.IsPoseAndIntrinsicDefined( view ) )
-      {
+    // OpenMVG and COLMAP both store world-to-camera: x_cam = R X + t, t = -R C
+    const geometry::Pose3 pose = sfm_data.GetPoseOrDie(view);
+    Eigen::Quaterniond q(pose.rotation());
+    q.normalize();
+    if (q.w() < 0) // canonical sign
+      q.coeffs() *= -1.0;
+    const Vec3 t = pose.translation();
+
+    ColmapImage image;
+    image.id = view->id_view;
+    image.qw = q.w(); image.qx = q.x(); image.qy = q.y(); image.qz = q.z();
+    image.tx = t.x(); image.ty = t.y(); image.tz = t.z();
+    image.camera_id = view->id_intrinsic;
+    image.name = ColmapImageName(sfm_data.s_root_path, view->s_Img_path);
+    image.image_path = stlplus::is_full_path(view->s_Img_path)
+      ? view->s_Img_path
+      : stlplus::create_filespec(image_root, view->s_Img_path);
+    view_to_image[view->id_view] = model.images.size();
+    model.images.push_back(std::move(image));
+  }
+  if (skipped_views > 0)
+    OPENMVG_LOG_WARNING << skipped_views
+      << " posed views were skipped because of an unsupported intrinsic.";
+
+  // Points: the observations in exported images. POINT2D_IDX is the index in
+  // the image's list of 2D points.
+  for (const auto & it : sfm_data.GetLandmarks())
+  {
+    const Landmark & landmark = it.second;
+    ColmapPoint3D point;
+    point.id = it.first;
+    point.x = landmark.X.x(); point.y = landmark.X.y(); point.z = landmark.X.z();
+    double error_sum = 0.0;
+    for (const auto & obs : landmark.obs)
+    {
+      const auto image_it = view_to_image.find(obs.first);
+      if (image_it == view_to_image.end())
         continue;
-      }
+      ColmapImage & image = model.images[image_it->second];
+      const View * view = sfm_data.GetViews().at(obs.first).get();
+      const IntrinsicBase * intrinsic =
+        sfm_data.GetIntrinsics().at(view->id_intrinsic).get();
+      const geometry::Pose3 pose = sfm_data.GetPoseOrDie(view);
+      error_sum += intrinsic->residual(pose(landmark.X), obs.second.x).norm();
 
-      const Pose3 pose = sfm_data.GetPoseOrDie( view );
-      const Mat3 rotation = pose.rotation();
-      const Vec3 translation = pose.translation();
+      const uint32_t point2D_idx = static_cast<uint32_t>(image.points2D.size());
+      image.points2D.push_back({obs.second.x.x() + kPixelOffset,
+                                obs.second.x.y() + kPixelOffset, point.id});
+      image.openmvg_xy.push_back(obs.second.x);
+      point.track.emplace_back(image.id, point2D_idx);
+    }
+    if (point.track.empty())
+      continue;
+    point.error = error_sum / point.track.size();
+    model.points3D.push_back(std::move(point));
+  }
+  return model;
+}
 
-      const double Tx = translation[0];
-      const double Ty = translation[1];
-      const double Tz = translation[2];
-      Eigen::Quaterniond q( rotation );
-      const double Qx = q.x();
-      const double Qy = q.y();
-      const double Qz = q.z();
-      const double Qw = q.w();
+/// Color the points from the images. Colors are optional: points that cannot
+/// be colored (missing or unreadable images) keep the default gray.
+void ColorizePoints(ColmapModel & model)
+{
+  std::map<uint64_t, size_t> point_index;
+  for (size_t i = 0; i < model.points3D.size(); ++i)
+    point_index[model.points3D[i].id] = i;
 
-      const IndexT image_id = view->id_view;
-      // Colmap's camera_ids correspond to openMVG's intrinsic ids
-      const IndexT camera_id = view->id_intrinsic;                           
-      const std::string image_name = view->s_Img_path;
-
-      // first line per image
-      //IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME
-      images_file << image_id << " "
-         << Qw << " "
-         << Qx << " "
-         << Qy << " "
-         << Qz << " "
-         << Tx << " "
-         << Ty << " "
-         << Tz << " "
-         << camera_id << " "
-         << image_name << " "     
-         << "\n";
-
-      // second line per image 
-      //POINTS2D[] as (X, Y, POINT3D_ID)
-      for (auto point2D: viewIdToPoints2D[image_id]) 
+  size_t remaining = model.points3D.size();
+  size_t unreadable_images = 0;
+  for (const ColmapImage & image : model.images)
+  {
+    if (remaining == 0)
+      break;
+    bool needed = false;
+    for (const ColmapPoint2D & p : image.points2D)
+      if (!model.points3D[point_index[p.point3D_id]].has_color)
       {
-        images_file << std::get<0>(point2D) << " " << 
-        std::get<1>(point2D) << " " <<
-        std::get<2>(point2D) << " ";
+        needed = true;
+        break;
       }
-      images_file << "\n";
-    }
-  }
-  return true;
-}
+    if (!needed)
+      continue;
 
-bool CreatePoint3DFile( const SfM_Data & sfm_data,
-                      const std::string & sPoints3DFilename,
-                      const int& floating_point_precision_digit)
-{
- /* points3D.txt
-      # 3D point list with one line of data per point:
-      #   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)
-      # Number of points: X, mean track length: Y
-  */
-
-  std::ofstream points3D_file( sPoints3DFilename );
-  points3D_file.precision(floating_point_precision_digit);
-
-  if ( ! points3D_file )
-  {
-    OPENMVG_LOG_ERROR << "Cannot write file" << sPoints3DFilename;
-    return false;
-  }
-  points3D_file << "# 3D point list with one line of data per point:\n";
-  points3D_file << "#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n";
-  points3D_file << "# Number of points: X, mean track length: Y\n";
-
-  const Landmarks & landmarks = sfm_data.GetLandmarks();
-
-  std::vector<Vec3> vec_3dPoints, vec_tracksColor;
-  if (!ColorizeTracks(sfm_data, vec_3dPoints, vec_tracksColor)) {
-    return false;
-  }
-
-  system::LoggerProgress my_progress_bar( landmarks.size(), "- CREATE POINT3D FILE  -" );
-  int point_index = 0;
-  for ( Landmarks::const_iterator iterLandmarks = landmarks.begin();
-        iterLandmarks != landmarks.end(); ++iterLandmarks, ++my_progress_bar )
-  {
-    const Vec3 exportPoint = iterLandmarks->second.X;
-    const IndexT point3d_id = iterLandmarks->first;
-    points3D_file << point3d_id << " "
-      << exportPoint.x() << " " 
-      << exportPoint.y() << " " 
-      << exportPoint.z() << " "
-    
-      << static_cast<int>(vec_tracksColor.at(point_index)(0)) << " " 
-      << static_cast<int>(vec_tracksColor.at(point_index)(1)) << " " 
-      << static_cast<int>(vec_tracksColor.at(point_index)(2)) << " ";
-
-    ++point_index;
-
-    const double error = 0.0;     // Some error
-    points3D_file << error;
-
-    const Observations & obs = iterLandmarks->second.obs;
-    for ( Observations::const_iterator itObs = obs.begin(); itObs != obs.end(); ++itObs )
+    if (!stlplus::file_exists(image.image_path))
     {
-      const IndexT viewId = itObs->first;
-      const IndexT featId = itObs->second.id_feat;
-
-      points3D_file << " " 
-      << viewId << " " 
-      << featId;
+      OPENMVG_LOG_WARNING << "Image \"" << image.image_path
+        << "\" not found; cannot color its points.";
+      ++unreadable_images;
+      continue;
     }
-    points3D_file << "\n";
+    image::Image<image::RGBColor> rgb;
+    image::Image<unsigned char> gray;
+    const bool is_rgb = image::ReadImage(image.image_path.c_str(), &rgb) != 0;
+    if (!is_rgb && !image::ReadImage(image.image_path.c_str(), &gray))
+    {
+      OPENMVG_LOG_WARNING << "Cannot read image \"" << image.image_path
+        << "\" to color points.";
+      ++unreadable_images;
+      continue;
+    }
+    const int w = is_rgb ? rgb.Width() : gray.Width();
+    const int h = is_rgb ? rgb.Height() : gray.Height();
+    if (w <= 0 || h <= 0)
+      continue;
+    for (size_t i = 0; i < image.points2D.size(); ++i)
+    {
+      ColmapPoint3D & point = model.points3D[point_index[image.points2D[i].point3D_id]];
+      if (point.has_color)
+        continue;
+      // OpenMVG coordinates: pixel centres at integers
+      const int x = std::min(std::max(0, static_cast<int>(std::lround(image.openmvg_xy[i].x()))), w - 1);
+      const int y = std::min(std::max(0, static_cast<int>(std::lround(image.openmvg_xy[i].y()))), h - 1);
+      if (is_rgb)
+      {
+        const image::RGBColor & c = rgb(y, x);
+        point.r = c.r(); point.g = c.g(); point.b = c.b();
+      }
+      else
+      {
+        point.r = point.g = point.b = gray(y, x);
+      }
+      point.has_color = true;
+      --remaining;
+    }
   }
-
-  return true;
+  if (remaining > 0)
+    OPENMVG_LOG_WARNING << remaining << " of " << model.points3D.size()
+      << " points could not be colored (" << unreadable_images
+      << " unreadable images); they are written in gray.";
 }
 
-/**
-* @brief Convert OpenMVG reconstruction result to Colmap's reconstruction format. 
-* @param sfm_data Structure from Motion file
-* @param sOutDirectory Output directory
-* @param sCamerasFilename File name of the camera file
-* @param sImagesFilename File name of the image file
-* @param sPoints3DFilename File name of the point3D file
-* @param floating_point_precision_digit Decimal precision to be used to format floating-point values for output files
-*/
-bool CreateColmapFolder( const SfM_Data & sfm_data,
-                    const std::string & sOutDirectory,
-                    const std::string & sCamerasFilename,
-                    const std::string & sImagesFilename, 
-                    const std::string & sPoints3DFilename,
-                    const int& floating_point_precision_digit)
+// --- Text output ---------------------------------------------------------
+
+bool WriteText(const ColmapModel & model, const std::string & dir, int precision)
 {
-  /* Colmap Output structure:
-      cameras.txt
-      images.txt
-      points3D.txt
-  */
-  if (!CreateCameraFile(sfm_data, sCamerasFilename, floating_point_precision_digit)) 
+  const std::string cameras_file = stlplus::create_filespec(dir, "cameras.txt");
+  const std::string images_file = stlplus::create_filespec(dir, "images.txt");
+  const std::string points_file = stlplus::create_filespec(dir, "points3D.txt");
+
   {
-    return false;
+    std::ofstream out(cameras_file, std::ios::binary);
+    if (!out)
+    {
+      OPENMVG_LOG_ERROR << "Cannot write file " << cameras_file;
+      return false;
+    }
+    out.precision(precision);
+    out << "# Camera list with one line of data per camera:\n"
+        << "#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n"
+        << "# Number of cameras: " << model.cameras.size() << "\n";
+    for (const auto & it : model.cameras)
+    {
+      const ColmapCamera & c = it.second;
+      out << c.id << " " << c.model_name << " " << c.width << " " << c.height;
+      for (const double v : c.params)
+        out << " " << v;
+      out << "\n";
+    }
+    if (!out)
+      return false;
   }
-  if (!CreateImageFile(sfm_data, sImagesFilename, floating_point_precision_digit))
   {
-    return false;
+    std::ofstream out(images_file, std::ios::binary);
+    if (!out)
+    {
+      OPENMVG_LOG_ERROR << "Cannot write file " << images_file;
+      return false;
+    }
+    out.precision(precision);
+    size_t num_obs = 0;
+    for (const ColmapImage & image : model.images)
+      num_obs += image.points2D.size();
+    out << "# Image list with two lines of data per image:\n"
+        << "#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n"
+        << "#   POINTS2D[] as (X, Y, POINT3D_ID)\n"
+        << "# Number of images: " << model.images.size()
+        << ", mean observations per image: "
+        << (model.images.empty() ? 0.0 : double(num_obs) / model.images.size())
+        << "\n";
+    for (const ColmapImage & image : model.images)
+    {
+      out << image.id << " " << image.qw << " " << image.qx << " " << image.qy
+          << " " << image.qz << " " << image.tx << " " << image.ty << " "
+          << image.tz << " " << image.camera_id << " " << image.name << "\n";
+      for (size_t i = 0; i < image.points2D.size(); ++i)
+      {
+        const ColmapPoint2D & p = image.points2D[i];
+        if (i > 0)
+          out << " ";
+        out << p.x << " " << p.y << " ";
+        if (p.point3D_id == kInvalidPoint3DId)
+          out << -1;
+        else
+          out << p.point3D_id;
+      }
+      out << "\n";
+    }
+    if (!out)
+      return false;
   }
-  if (! CreatePoint3DFile(sfm_data, sPoints3DFilename, floating_point_precision_digit))
   {
-    return false;
+    std::ofstream out(points_file, std::ios::binary);
+    if (!out)
+    {
+      OPENMVG_LOG_ERROR << "Cannot write file " << points_file;
+      return false;
+    }
+    out.precision(precision);
+    size_t track_sum = 0;
+    for (const ColmapPoint3D & p : model.points3D)
+      track_sum += p.track.size();
+    out << "# 3D point list with one line of data per point:\n"
+        << "#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n"
+        << "# Number of points: " << model.points3D.size()
+        << ", mean track length: "
+        << (model.points3D.empty() ? 0.0 : double(track_sum) / model.points3D.size())
+        << "\n";
+    for (const ColmapPoint3D & p : model.points3D)
+    {
+      out << p.id << " " << p.x << " " << p.y << " " << p.z << " "
+          << int(p.r) << " " << int(p.g) << " " << int(p.b) << " " << p.error;
+      for (const auto & t : p.track)
+        out << " " << t.first << " " << t.second;
+      out << "\n";
+    }
+    if (!out)
+      return false;
   }
   return true;
 }
 
-/**
-* @brief Main function used to export a Colmap reconstruction folder
-* @param sfm_data Structure from Motion file to export
-* @param sOutDirectory Output directory
-*/
-bool exportToColmap( const SfM_Data & sfm_data , const std::string & sOutDirectory , const int& floating_point_precision_digit)
+// --- Binary output (little-endian) ---------------------------------------
+
+template <typename T>
+void WriteLE(std::ostream & out, T value)
 {
-  // Create output directory
-  bool bOk = false;
-  if ( !stlplus::is_folder( sOutDirectory ) )
+  static_assert(std::is_integral<T>::value, "integral type expected");
+  using U = typename std::make_unsigned<T>::type;
+  U u = static_cast<U>(value);
+  char bytes[sizeof(T)];
+  for (size_t i = 0; i < sizeof(T); ++i)
   {
-    OPENMVG_LOG_INFO << "\033[1;31mCreating directory:  " << sOutDirectory << "\033[0m\n";
-    stlplus::folder_create( sOutDirectory );
-    bOk = stlplus::is_folder( sOutDirectory );
+    bytes[i] = static_cast<char>(u & 0xFF);
+    u = static_cast<U>(u >> 8);
   }
-  else
-  {
-    bOk = true;
-  }
+  out.write(bytes, sizeof(T));
+}
 
-  if ( !bOk )
+void WriteLE(std::ostream & out, double value)
+{
+  static_assert(sizeof(double) == sizeof(uint64_t), "64-bit double expected");
+  uint64_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  WriteLE<uint64_t>(out, bits);
+}
+
+bool WriteBinary(const ColmapModel & model, const std::string & dir)
+{
+  const std::string cameras_file = stlplus::create_filespec(dir, "cameras.bin");
+  const std::string images_file = stlplus::create_filespec(dir, "images.bin");
+  const std::string points_file = stlplus::create_filespec(dir, "points3D.bin");
+
   {
-    OPENMVG_LOG_ERROR << "Cannot access one of the desired output directories";
-    return false;
+    std::ofstream out(cameras_file, std::ios::binary);
+    if (!out)
+    {
+      OPENMVG_LOG_ERROR << "Cannot write file " << cameras_file;
+      return false;
+    }
+    WriteLE<uint64_t>(out, model.cameras.size());
+    for (const auto & it : model.cameras)
+    {
+      const ColmapCamera & c = it.second;
+      WriteLE<uint32_t>(out, c.id);
+      WriteLE<int32_t>(out, c.model_id);
+      WriteLE<uint64_t>(out, c.width);
+      WriteLE<uint64_t>(out, c.height);
+      for (const double v : c.params)
+        WriteLE(out, v);
+    }
+    if (!out)
+      return false;
   }
-  const std::string sCamerasFilename = stlplus::create_filespec( sOutDirectory , "cameras.txt" );
-  const std::string sImagesFilename = stlplus::create_filespec( sOutDirectory , "images.txt" );
-  const std::string sPoints3DFilename = stlplus::create_filespec( sOutDirectory , "points3D.txt" );
-  if ( ! CreateColmapFolder( sfm_data , sOutDirectory , sCamerasFilename, sImagesFilename, sPoints3DFilename, floating_point_precision_digit) )
   {
-    OPENMVG_LOG_ERROR << "There was an error exporting project";
-    return false;
+    std::ofstream out(images_file, std::ios::binary);
+    if (!out)
+    {
+      OPENMVG_LOG_ERROR << "Cannot write file " << images_file;
+      return false;
+    }
+    WriteLE<uint64_t>(out, model.images.size());
+    for (const ColmapImage & image : model.images)
+    {
+      WriteLE<uint32_t>(out, image.id);
+      WriteLE(out, image.qw); WriteLE(out, image.qx);
+      WriteLE(out, image.qy); WriteLE(out, image.qz);
+      WriteLE(out, image.tx); WriteLE(out, image.ty); WriteLE(out, image.tz);
+      WriteLE<uint32_t>(out, image.camera_id);
+      out.write(image.name.c_str(), image.name.size() + 1); // with the NUL
+      WriteLE<uint64_t>(out, image.points2D.size());
+      for (const ColmapPoint2D & p : image.points2D)
+      {
+        WriteLE(out, p.x);
+        WriteLE(out, p.y);
+        WriteLE<uint64_t>(out, p.point3D_id);
+      }
+    }
+    if (!out)
+      return false;
+  }
+  {
+    std::ofstream out(points_file, std::ios::binary);
+    if (!out)
+    {
+      OPENMVG_LOG_ERROR << "Cannot write file " << points_file;
+      return false;
+    }
+    WriteLE<uint64_t>(out, model.points3D.size());
+    for (const ColmapPoint3D & p : model.points3D)
+    {
+      WriteLE<uint64_t>(out, p.id);
+      WriteLE(out, p.x); WriteLE(out, p.y); WriteLE(out, p.z);
+      WriteLE<uint8_t>(out, p.r); WriteLE<uint8_t>(out, p.g); WriteLE<uint8_t>(out, p.b);
+      WriteLE(out, p.error);
+      WriteLE<uint64_t>(out, p.track.size());
+      for (const auto & t : p.track)
+      {
+        WriteLE<uint32_t>(out, t.first);
+        WriteLE<uint32_t>(out, t.second);
+      }
+    }
+    if (!out)
+      return false;
   }
   return true;
-
 }
+
+} // namespace
 
 int main( int argc , char ** argv )
 {
-
   CmdLine cmd;
   std::string sSfM_Data_Filename;
   std::string sOutDir = "";
-  int floating_point_precision_digit = 16;
+  std::string sFormat = "txt";
+  // max_digits10 (17) digits make every double read back exactly
+  int floating_point_precision_digit = std::numeric_limits<double>::max_digits10;
+  bool bNoColor = false;
 
   cmd.add( make_option( 'i', sSfM_Data_Filename, "sfmdata" ) );
   cmd.add( make_option( 'o', sOutDir, "outdir" ) );
-  cmd.add(make_option('p', floating_point_precision_digit, "precision"));
+  cmd.add( make_option( 'f', sFormat, "format" ) );
+  cmd.add( make_option( 'p', floating_point_precision_digit, "precision" ) );
+  cmd.add( make_switch( 'n', "no_color" ) );
 
   OPENMVG_LOG_INFO << "Note: this program writes output in Colmap file format.\n";
 
@@ -447,19 +631,46 @@ int main( int argc , char ** argv )
   }
   catch ( const std::string& s )
   {
-    OPENMVG_LOG_INFO 
-              << "Usage: " << argv[0] << '\n'
-              << "[-i|--sfmdata] filename, the SfM_Data file to convert\n"
-              << "[-o|--outdir] path where cameras.txt, images.txt and points3D.txt will be saved"
-              << "\n[Optional]\n"
-              << "[-p|--precision] sets the decimal precision to be used to format floating-point values (default = "<<floating_point_precision_digit<< ")";
+    OPENMVG_LOG_INFO
+      << "Usage: " << argv[0] << '\n'
+      << "[-i|--sfmdata] filename, the SfM_Data file to convert\n"
+      << "[-o|--outdir] directory where the COLMAP model is saved\n"
+      << "\n[Optional]\n"
+      << "[-f|--format] txt: cameras.txt, images.txt, points3D.txt (default)\n"
+      << "              bin: cameras.bin, images.bin, points3D.bin\n"
+      << "              both: text and binary files\n"
+      << "[-n|--no_color] do not read the images to color the points (gray)\n"
+      << "[-p|--precision] significant digits of floating-point values in text "
+         "files (default = " << floating_point_precision_digit
+      << ", which reads back exactly)";
     OPENMVG_LOG_ERROR << s;
     return EXIT_FAILURE;
   }
+  bNoColor = cmd.used('n');
 
-  if ( !stlplus::folder_exists( sOutDir ) )
+  const bool bWriteText = (sFormat == "txt" || sFormat == "both");
+  const bool bWriteBinary = (sFormat == "bin" || sFormat == "both");
+  if (!bWriteText && !bWriteBinary)
   {
-    stlplus::folder_create( sOutDir );
+    OPENMVG_LOG_ERROR << "Unknown format \"" << sFormat << "\" (use txt, bin or both).";
+    return EXIT_FAILURE;
+  }
+  if (sOutDir.empty())
+  {
+    OPENMVG_LOG_ERROR << "No output directory given.";
+    return EXIT_FAILURE;
+  }
+
+  if (floating_point_precision_digit < 6)
+  {
+    OPENMVG_LOG_WARNING << "The precision will be set to 6.";
+    floating_point_precision_digit = 6;
+  }
+  else if (floating_point_precision_digit < std::numeric_limits<double>::max_digits10)
+  {
+    OPENMVG_LOG_WARNING << "With a precision below "
+      << std::numeric_limits<double>::max_digits10
+      << " the text files do not read back exactly.";
   }
 
   // Read the input SfM scene
@@ -467,19 +678,36 @@ int main( int argc , char ** argv )
   if ( !Load( sfm_data, sSfM_Data_Filename, ESfM_Data( ALL ) ) )
   {
     OPENMVG_LOG_ERROR
-              << "\nThe input SfM_Data file \"" << sSfM_Data_Filename << "\" cannot be read.";
+      << "\nThe input SfM_Data file \"" << sSfM_Data_Filename << "\" cannot be read.";
     return EXIT_FAILURE;
   }
 
-  if (floating_point_precision_digit < 6)
+  if ( !stlplus::folder_exists( sOutDir ) && !stlplus::folder_create( sOutDir ) )
   {
-    OPENMVG_LOG_WARNING << "\nThe precision will be set to 6\n";
-    floating_point_precision_digit = 6;
+    OPENMVG_LOG_ERROR << "Cannot create the output directory " << sOutDir;
+    return EXIT_FAILURE;
   }
 
-  if ( ! exportToColmap( sfm_data , sOutDir , floating_point_precision_digit) )
+  const std::string image_root = ResolveRootPath(sfm_data.s_root_path, sSfM_Data_Filename);
+  ColmapModel model = BuildModel(sfm_data, image_root);
+  if (!bNoColor)
+    ColorizePoints(model);
+
+  size_t num_obs = 0;
+  for (const ColmapImage & image : model.images)
+    num_obs += image.points2D.size();
+  OPENMVG_LOG_INFO << "COLMAP model: " << model.cameras.size() << " cameras, "
+    << model.images.size() << " images, " << model.points3D.size()
+    << " points, " << num_obs << " observations.";
+
+  if (bWriteText && !WriteText(model, sOutDir, floating_point_precision_digit))
   {
-    OPENMVG_LOG_ERROR << "There was an error during export of the file";
+    OPENMVG_LOG_ERROR << "There was an error writing the text model.";
+    return EXIT_FAILURE;
+  }
+  if (bWriteBinary && !WriteBinary(model, sOutDir))
+  {
+    OPENMVG_LOG_ERROR << "There was an error writing the binary model.";
     return EXIT_FAILURE;
   }
 
